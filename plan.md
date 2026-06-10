@@ -8,7 +8,7 @@
 
 ## 关键词
 
-算子编译，TileLang，GEMM，自动调优，算子融合
+算子编译，TileLang，GEMM，算子融合，Norm，Attention，自动调优
 
 ## 项目背景
 
@@ -16,11 +16,12 @@
 
 ## 项目内容
 
-基于 TileLang 复现典型 LLM 算子（GEMM）的编译与优化过程：
+基于 TileLang 复现典型 LLM 算子的编译与优化过程：
 
 1. 使用 Level 2 抽象（分块 + 共享内存）实现 GEMM 算子的编译与正确性验证
-2. 实现 GEMM + ReLU 融合算子
-3. 使用 TileLang 内置自动调优工具，对分块参数进行搜索，获得性能对比数据
+2. 实现算子融合（Norm + GEMM 及 GEMM + Activation），与 CUDA / Triton / PyTorch 做多维度性能对比
+3. 各自实现一种 Attention 算子（如 Flash Attention / Online Softmax Attention 等）
+4. 使用 TileLang 内置自动调优工具，对分块参数进行搜索，获得性能对比数据
 
 参考对象：TileLang 官方教程及算子示例（https://github.com/tile-ai/tilelang）
 
@@ -129,60 +130,91 @@ python examples/gemm/example_gemm.py
 
 ---
 
-## 阶段二：GEMM 算子复现（6/5 – 6/12）
+## 阶段二：算子融合与多后端性能对比（6/5 – 6/12）
 
-目标：自主实现 GEMM 算子，完成正确性验证和基准性能测试。
+目标：各自实现一种算子融合，并与 CUDA、Triton、PyTorch、TileLang 非融合版本做性能对比。
 
-### 同学 A：GEMM 实现
+### 同学 A：Norm + GEMM 融合
 
-- 参考 `examples/gemm/example_gemm.py`，自己重写一个 GEMM kernel（不要直接复制），加深对 Tiling + Pipelining + Tensor Core 调度流程的理解
-- 核心模式：分配 shared memory → 清零 fragment → Pipelined 循环（copy A/B to shared → gemm）→ copy 结果回 global
+- 融合 RMSNorm（或 LayerNorm）与 GEMM，参考 `examples/norm/rms_norm.py` 和 `examples/gemm/example_gemm.py`
+- 融合策略：在 fragment / shared memory 上完成 Norm 计算后直接送入 GEMM，避免将中间结果写回 global memory
 - 实验方案：
-  1. 固定 block 参数，测试不同矩阵大小（512/1024/2048/4096）
-  2. 固定矩阵大小，测试不同 block 参数（block_M/N: 64/128/256; block_K: 16/32/64）
-  3. 记录每种配置的延迟，分析分块参数对性能的影响
+  1. 实现 RMSNorm + GEMM 融合 kernel
+  2. 分别在不同矩阵大小（512/1024/2048/4096）下测试
+  3. 性能对比（至少 5 条线）：
+     - TileLang 融合版本
+     - TileLang 非融合版本（Norm kernel + GEMM kernel 两次调用）
+     - CUDA 实现（PyTorch `F.rms_norm` + `torch.mm`）
+     - Triton 实现（手写或参考开源实现）
+     - PyTorch 原生（`F.rms_norm` + `torch.mm`）
+  4. 记录每种配置的延迟，分析融合收益（减少了多少次 global memory 读写）
 
-### 同学 B：正确性测试与基准性能
+### 同学 B：GEMM + Activation 融合
 
-- 使用 `kernel.get_profiler()` 获取 Profiler 对象，调用 `profiler.assert_allclose(ref_program=...)` 以 PyTorch `a @ b` 为参考验证正确性
-- 使用 `profiler.do_bench(backend="cupti")` 或 `tilelang.profiler.do_bench()` 测延迟，backend 可选 `"cupti"`（更精确）或 `"event"`
-- 用 `kernel.get_kernel_source()` 查看生成的 CUDA 源码，对照理解编译结果
-- 输出 TileLang vs PyTorch 延迟对比及 speedup
+- 参考 `examples/quickstart.py`（GEMM + ReLU），在 `T.gemm` 之后、`T.copy` 写回之前，用 `T.Parallel` 循环 + `T.max(x, 0)` 插入激活函数
+- 实现 GEMM + ReLU 以及 GEMM + GELU（使用 `T.tanh` 或 `T.erf` + `T.cast`）两种融合
+- 理解融合的意义：在 fragment 上就地计算，避免中间结果写回 global memory 再读出
+- 实验方案：
+  1. 实现 GEMM + ReLU 和 GEMM + GELU 融合 kernel
+  2. 分别在不同矩阵大小（512/1024/2048/4096）下测试
+  3. 性能对比（至少 5 条线）：
+     - TileLang 融合版本
+     - TileLang 非融合版本（GEMM kernel + Activation kernel 两次调用）
+     - CUDA 实现（`torch.mm` + `F.relu` / `F.gelu`）
+     - Triton 实现（手写或参考开源实现）
+     - PyTorch 原生（`torch.mm` + `F.relu` / `F.gelu`）
+  4. 记录每种配置的延迟，对比 ReLU 和 GELU 融合的收益差异
 
 ### 阶段二交付物
 
-- [ ] 自主实现的 GEMM kernel 可运行，与 PyTorch 误差在 `rtol=1e-2` 以内
-- [ ] 不同 M/N/K 和不同 block 大小的性能对比表格
-- [ ] 中期检查：可展示的 GEMM 复现结果 + 性能数据
+- [ ] 同学 A：RMSNorm + GEMM 融合 kernel 可运行，正确性验证通过
+- [ ] 同学 B：GEMM + ReLU / GELU 融合 kernel 可运行，正确性验证通过
+- [ ] 五维度性能对比表格 + 柱状图：TileLang Fused / TileLang Non-Fused / CUDA / Triton / PyTorch
+- [ ] 中期检查：可展示的融合算子 + 性能数据
 
 ---
 
-## 阶段三：算子融合与自动调优（6/16 – 6/22）
+## 阶段三：Attention 算子实现（6/16 – 6/22）
 
-### 同学 A：GEMM + ReLU 融合
+目标：两位同学各自选择一种 Attention 算子，基于 TileLang 实现并做性能对比。
 
-- 参考 `examples/quickstart.py`（已包含 GEMM + ReLU），在阶段二的 GEMM 基础上，在 `T.gemm` 之后、`T.copy` 写回之前，用 `T.Parallel` 循环 + `T.max(x, 0)` 插入 ReLU 激活
-- 理解融合的意义：在 fragment 上就地计算，避免中间结果写回 global memory 再读出
-- 选做：尝试 GEMM + GELU 融合（使用 `T.tanh` 和 `T.cast`）
+### Attention 候选列表（各选一种）
 
-### 同学 B：自动调优
+| Attention 类型 | 难度 | 参考文件 | 说明 |
+|---------------|------|---------|------|
+| Online Softmax Attention | 中等 | `examples/online_softmax/online_softmax.py` | 基于 online softmax 的 safe attention，阶段一已学过 |
+| Flash Attention 1 | 较高 | `examples/flash_attention/` | 分块 + 重计算，避免 O(N²) 中间矩阵写回 HBM |
+| Flash Attention 2 | 高 | `examples/flash_attention/` | 在 FA1 基础上增加 causal mask 和更好的 warp 调度 |
+| Flash Linear Attention | 较高 | 需自行调研 | 线性注意力，适合长序列场景 |
+| Sparse Attention | 高 | 需自行调研 | 块稀疏 / sliding window 等变体 |
 
-- TileLang 提供两种调优方式：
-  - **装饰器模式**：在 `@tilelang.jit` 上添加 `@tilelang.autotune(configs=...)`，`compile()` 时自动搜索最佳配置。参考 `examples/convolution/example_convolution_autotune.py`
-  - **AutoTuner API**：`AutoTuner.from_kernel()` → `set_compile_args()` → `set_profile_args()` → `run()`，更灵活。参考 `examples/gemm/example_gemm_autotune.py` 和 `examples/gemm/example_gemm_advanced_autotune.py`
-- 建议使用 AutoTuner API，搜索 7-15 个配置（block_M/N/K 和 num_stages 的组合），对比最佳结果与手动选参的性能差异
-- 可配置环境变量 `TILELANG_AUTO_TUNING_DISABLE_CACHE=1` 禁用缓存确保每次重新搜索，`TILELANG_AUTO_TUNING_CPU_COUNTS=4` 控制并行线程数
-- 参考测试用例 `testing/python/autotune/` 了解 API 的正确用法
+### 实现要求
+
+- 基于 TileLang 自主实现所选 Attention 算子的 forward pass（选做 backward）
+- 核心模式：分块 softmax → rescale → 累加输出，使用 `T.Pipelined` 或 `T.Serial` 沿序列维度循环
+- 理解 Attention 的访存瓶颈：QK^T 产生 `[seq_len, seq_len]` 中间矩阵，Flash Attention 通过分块避免将其写回 HBM
+
+### 实验方案
+
+1. 固定 head_dim，测试不同序列长度（512/1024/2048/4096）
+2. 性能对比（至少 3 条线）：
+   - TileLang Attention
+   - PyTorch 原生（`F.scaled_dot_product_attention` 或手动实现）
+   - Triton 实现（参考开源 Flash Attention Triton 版本）
+3. 可选对比 CUDA 实现（如 `flash_attn` 库）
+4. 分析不同序列长度下的带宽利用率和计算强度
 
 ### 阶段三交付物
 
-- [ ] GEMM + ReLU 融合 kernel 可运行，正确性验证通过
-- [ ] 自动调优脚本可运行，输出最佳配置和性能数据
-- [ ] 性能对比：手动参数 vs 自动调优最优参数 vs PyTorch，至少 3 种矩阵大小
+- [ ] Attention 算子 forward pass 可运行，与 PyTorch 误差在 `rtol=1e-2` 以内
+- [ ] 不同序列长度的性能对比表格 + 折线图
+- [ ] 与 PyTorch / Triton 的延迟对比及 speedup
 
 ---
 
 ## 阶段四：实验总结与报告撰写（6/23 – 6/28）
+
+> 暂未确定具体分工，以下为初步框架。
 
 ### 同学 A：技术章节
 
@@ -190,8 +222,10 @@ python examples/gemm/example_gemm.py
 
 - **背景**：算子编译器的作用，TileLang 的定位
 - **方法**：TileLang 的分块抽象、软件流水线、tensor core 调度
-- **实现细节**：GEMM 的 tiling 策略（global → shared → fragment），融合算子的内存优化原理（避免中间结果写回 global memory）
-- **性能图表**：不同分块参数的延迟对比（柱状图）、TileLang vs PyTorch 性能对比（柱状图）
+- **实现细节**：
+  - 阶段二的融合算子实现（Norm + GEMM 或 GEMM + Activation），内存优化原理
+  - 阶段三的 Attention 实现，分块 softmax / Flash Attention 的访存优化
+- **性能图表**：融合 vs 非融合 vs 多后端对比（柱状图）、Attention 不同序列长度对比（折线图）
 
 推荐使用 matplotlib/seaborn 绘图（已在 `requirements-test.txt` 中）：
 
@@ -199,25 +233,33 @@ python examples/gemm/example_gemm.py
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# 示例：不同 block_M 的延迟对比
-configs = ["64", "128", "256"]
-latencies = [0.123, 0.098, 0.115]  # ms
-plt.bar(configs, latencies)
-plt.xlabel("block_M")
+# 示例：融合 vs 非融合 vs CUDA vs Triton vs PyTorch 性能对比
+backends = ["TileLang\nFused", "TileLang\nNon-Fused", "CUDA", "Triton", "PyTorch"]
+latencies = [0.098, 0.145, 0.102, 0.110, 0.105]  # ms
+plt.bar(backends, latencies)
 plt.ylabel("Latency (ms)")
-plt.savefig("block_M_comparison.png", dpi=150)
+plt.title("GEMM + ReLU Fusion: Backend Comparison (M=N=K=4096)")
+plt.savefig("fusion_backend_comparison.png", dpi=150)
 ```
 
 ### 同学 B：其余章节 + 统稿
 
-- **实验设置**：硬件环境（GPU 型号、CUDA 版本）、软件版本、测试方法
-- **结果分析**：分析分块大小如何影响 occupancy 和 memory bandwidth；分析融合算子的性能收益（减少了多少次 global memory 读写）；分析 `num_stages` 对流水线效率的影响
+- **实验设置**：硬件环境（GPU 型号、CUDA 版本、GPU 显存带宽）、软件版本（PyTorch / Triton / TileLang 版本号）、测试方法
+- **结果分析**：
+  - 分析融合算子的性能收益（减少了多少次 global memory 读写，带宽节省量）
+  - 分析 `num_stages` 对流水线效率的影响
+  - 分析 Attention 算子的计算强度和带宽利用率随序列长度的变化
+  - 讨论 TileLang 相比手写 CUDA 和 Triton 的优劣势
 - **结论**：总结 TileLang 在算子开发中的优缺点
-- **挑战与展望**：遇到的问题和解决过程，可能的后续方向（如扩展到 Flash Attention）
+- **挑战与展望**：遇到的问题和解决过程，可能的后续方向
 
 ### 最终产出
 
-- 完整的项目代码（`our_gemm.py`, `matmul_relu.py`, `autotune_experiment.py`）
+- 完整的项目代码：
+  - 阶段二：`norm_gemm_fusion.py`（同学 A）、`gemm_activation_fusion.py`（同学 B）
+  - 阶段二：CUDA / Triton baseline 脚本
+  - 阶段三：`xxx_attention.py`（各自实现）
+  - 性能测试脚本 + 绘图脚本
 - 项目报告（含性能图表）
 - 可选：PPT / Poster
 
@@ -281,9 +323,15 @@ python -c "import torch; print(torch.cuda.get_device_properties(0))"
 | 最简内核结构 | `examples/elementwise/example_elementwise_add.py` |
 | 标准 GEMM | `examples/gemm/example_gemm.py` |
 | GEMM + ReLU 融合 | `examples/quickstart.py` |
+| GEMM + GELU 融合 | 参考 `examples/quickstart.py` + `T.tanh` / `T.erf` |
+| Norm 实现 | `examples/norm/rms_norm.py` |
+| Flash Attention | `examples/flash_attention/` |
+| Online Softmax Attention | `examples/online_softmax/online_softmax.py` |
 | 装饰器式自动调优 | `examples/convolution/example_convolution_autotune.py` |
 | API 式自动调优 | `examples/gemm/example_gemm_autotune.py` |
 | 高级调优选项 | `examples/gemm/example_gemm_advanced_autotune.py` |
 | GEMM 测试用例 | `testing/python/kernel/test_tilelang_kernel_gemm.py` |
-| 在线 softmax | `examples/online_softmax/online_softmax.py` |
-| RMSNorm | `examples/norm/rms_norm.py` |
+| 自动调优测试用例 | `testing/python/autotune/` |
+| Triton GEMM 参考 | <https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html> |
+| Triton Flash Attention 参考 | <https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html> |
+| TileLang GitHub | <https://github.com/tile-ai/tilelang> |
