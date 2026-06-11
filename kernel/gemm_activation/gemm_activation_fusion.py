@@ -43,6 +43,7 @@ Phase 2 — GEMM + Activation Fusion
 
 import tilelang
 import tilelang.language as T
+import torch
 
 # ==============================================================================
 # 第一部分: 定义基准常量
@@ -420,51 +421,38 @@ try:
         c_mask = (rm[:, None] < M) & (rn[None, :] < N)
         tl.store(C, acc.to(tl.float16), mask=c_mask)
 
-    @triton.jit
-    def _triton_gemm_gelu_kernel(
-        A_ptr, B_ptr, C_ptr,
-        M, N, K,
-        stride_am, stride_ak,
-        stride_bk, stride_bn,
-        stride_cm, stride_cn,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    ):
-        """
-        Triton GEMM + GELU (tanh近似) 融合 kernel
-
-        与 ReLU 版本结构完全相同，只是激活函数不同。
-        GELU 使用了 tanh 近似公式（与 TileLang tanh 版本一致）。
-        """
-        pid_m = tl.program_id(axis=0)
-        pid_n = tl.program_id(axis=1)
-
-        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        rk = tl.arange(0, BLOCK_K)
-
-        A = A_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
-        B = B_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
-
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        for k in range(0, K, BLOCK_K):
-            a_mask = (rm[:, None] < M) & ((k + rk)[None, :] < K)
-            b_mask = ((k + rk)[:, None] < K) & (rn[None, :] < N)
-            a = tl.load(A, mask=a_mask, other=0.0)
-            b = tl.load(B, mask=b_mask, other=0.0)
-            acc += tl.dot(a, b)
-            A += BLOCK_K * stride_ak
-            B += BLOCK_K * stride_bk
-
-        # ---- 融合 GELU (tanh近似) ----
-        # 公式: 0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x^3)))
-        # 0.7978845608 ≈ sqrt(2/π)
-        inner = 0.7978845608028654 * (acc + 0.044715 * acc * acc * acc)
-        acc = 0.5 * acc * (1.0 + tl.math.tanh(inner))
-
-        C = C_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
-        c_mask = (rm[:, None] < M) & (rn[None, :] < N)
-        tl.store(C, acc.to(tl.float16), mask=c_mask)
+    # ---- Triton GELU kernel (暂时注释: Triton 没有 tl.math.tanh) ----
+    # @triton.jit
+    # def _triton_gemm_gelu_kernel(
+    #     A_ptr, B_ptr, C_ptr,
+    #     M, N, K,
+    #     stride_am, stride_ak,
+    #     stride_bk, stride_bn,
+    #     stride_cm, stride_cn,
+    #     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    # ):
+    #     """Triton GEMM + GELU (tanh近似) 融合 kernel"""
+    #     pid_m = tl.program_id(axis=0)
+    #     pid_n = tl.program_id(axis=1)
+    #     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    #     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    #     rk = tl.arange(0, BLOCK_K)
+    #     A = A_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+    #     B = B_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
+    #     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    #     for k in range(0, K, BLOCK_K):
+    #         a_mask = (rm[:, None] < M) & ((k + rk)[None, :] < K)
+    #         b_mask = ((k + rk)[:, None] < K) & (rn[None, :] < N)
+    #         a = tl.load(A, mask=a_mask, other=0.0)
+    #         b = tl.load(B, mask=b_mask, other=0.0)
+    #         acc += tl.dot(a, b)
+    #         A += BLOCK_K * stride_ak
+    #         B += BLOCK_K * stride_bk
+    #     inner = 0.7978845608028654 * (acc + 0.044715 * acc * acc * acc)
+    #     acc = 0.5 * acc * (1.0 + tl.math.tanh(inner))
+    #     C = C_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+    #     c_mask = (rm[:, None] < M) & (rn[None, :] < N)
+    #     tl.store(C, acc.to(tl.float16), mask=c_mask)
 
     def run_triton_gemm_relu(a, b):
         """
@@ -472,8 +460,6 @@ try:
 
         自动推导矩阵维度，计算 grid 大小，调用 Triton kernel。
         """
-        import torch
-
         M, K = a.shape
         _, N = b.shape
 
@@ -493,21 +479,22 @@ try:
         )
         return c
 
-    def run_triton_gemm_gelu(a, b):
-        """Triton GEMM + GELU 融合 kernel 的 Python 封装"""
-        M, K = a.shape
-        _, N = b.shape
-        c = torch.empty((M, N), device=a.device, dtype=torch.float16)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-        _triton_gemm_gelu_kernel[grid](
-            a, b, c,
-            M, N, K,
-            a.stride(0), a.stride(1),
-            b.stride(0), b.stride(1),
-            c.stride(0), c.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        )
-        return c
+    # ---- Triton GELU wrapper (暂时注释: tl.math.tanh 不可用) ----
+    # def run_triton_gemm_gelu(a, b):
+    #     """Triton GEMM + GELU 融合 kernel 的 Python 封装"""
+    #     M, K = a.shape
+    #     _, N = b.shape
+    #     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    #     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    #     _triton_gemm_gelu_kernel[grid](
+    #         a, b, c,
+    #         M, N, K,
+    #         a.stride(0), a.stride(1),
+    #         b.stride(0), b.stride(1),
+    #         c.stride(0), c.stride(1),
+    #         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    #     )
+    #     return c
 
     HAS_TRITON = True
 except ImportError:
@@ -530,8 +517,6 @@ def verify_correctness():
       3. 使用 torch.testing.assert_close 对照（rtol=1e-2，容忍 fp16 精度误差）
       4. 打印生成的 CUDA 源码
     """
-    import torch
-
     M, N, K = 1024, 1024, 1024
 
     # 生成随机测试数据（fp16，GPU）
@@ -633,8 +618,6 @@ def benchmark_torch(fn, warmup=10, rep=100):
     返回:
       平均延迟（毫秒）
     """
-    import torch
-
     # 预热：排除首次调用的 kernel launch / cuBLAS 初始化开销
     for _ in range(warmup):
         fn()
@@ -685,8 +668,6 @@ def run_all_benchmarks():
     返回:
       results: dict, 键为 (size, backend, variant) 元组，值为延迟(ms)
     """
-    import torch
-
     results = {}
 
     # 编译所有 TileLang kernel
@@ -790,13 +771,13 @@ def run_all_benchmarks():
         results[("CUDA", "GELU", size)] = lat_cuda_gelu
         print(f"  CUDA (cuBLAS + gelu):           {lat_cuda_gelu:.4f} ms")
 
-        # 5. Triton baseline
-        if HAS_TRITON:
-            lat_triton_gelu = benchmark_triton(
-                lambda x, y: run_triton_gemm_gelu(x, y), a, b
-            )
-            results[("Triton", "GELU", size)] = lat_triton_gelu
-            print(f"  Triton (GEMM+GELU):             {lat_triton_gelu:.4f} ms")
+        # 5. Triton GELU baseline (暂时跳过: tl.math.tanh 不可用)
+        # if HAS_TRITON:
+        #     lat_triton_gelu = benchmark_triton(
+        #         lambda x, y: run_triton_gemm_gelu(x, y), a, b
+        #     )
+        #     results[("Triton", "GELU", size)] = lat_triton_gelu
+        #     print(f"  Triton (GEMM+GELU):             {lat_triton_gelu:.4f} ms")
 
         # 6. PyTorch 原生
         def pt_gelu():
@@ -1025,8 +1006,6 @@ def main():
     如果你的 GPU 显存较小（< 8GB），建议将 SIZES 中的 4096 注释掉，
     因为 4096×4096 的矩阵需要的显存较大。
     """
-    import torch
-
     # 检查 CUDA 可用性
     if not torch.cuda.is_available():
         print("错误: 需要 CUDA GPU 才能运行此脚本")
