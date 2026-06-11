@@ -597,21 +597,24 @@ def verify_correctness():
 # ==============================================================================
 
 
-def benchmark_kernel(kernel_fn, a, b, warmup=10, rep=100):
+def benchmark_kernel(kernel_fn, a, b, warmup=25, rep=100):
     """
     使用 TileLang profiler 测量 kernel 延迟。
 
     参数:
       kernel_fn: 已编译的 TileLang kernel
       a, b: 输入 tensor
-      warmup: 预热次数（排除首次编译/缓存影响）
-      rep: 测量重复次数
+      warmup: 预热时间目标（毫秒），profiler 会自动计算迭代次数
+      rep: 测量时间目标（毫秒），profiler 会自动计算迭代次数
 
     返回:
       平均延迟（毫秒）
+
+    注意: Profiler.do_bench() 的 warmup/rep 是毫秒时间目标，不是迭代次数。
+          要直接传 tensor，需通过 input_tensors= 关键字参数。
     """
     profiler = kernel_fn.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
-    latency = profiler.do_bench(a, b, warmup=warmup, rep=rep)
+    latency = profiler.do_bench(input_tensors=[a, b], warmup=warmup, rep=rep)
     return latency
 
 
@@ -726,14 +729,8 @@ def run_all_benchmarks():
         results[("TileLang Fused", "ReLU", size)] = lat
         print(f"  TileLang Fused (ReLU):          {lat:.4f} ms")
 
-        # 2. TileLang 非融合版本: GEMM kernel + torch.relu
-        def tl_gemm_relu_nonfused():
-            c = kernels["gemm_only"](a, b)
-        lat_gemm = benchmark_torch(lambda: tl_gemm_relu_nonfused())
-        lat_relu = benchmark_torch(lambda: torch.relu(a @ b))
-        # 非融合总延迟 = GEMM + 单独的 relu kernel
-        # 注意：我们不能直接用 profiler 测两次 launch，因此拆开测然后相加
-        # 更准确的测量非融合总开销
+        # 2. TileLang 非融合版本: PyTorch gemm + relu (模拟非融合kernel调用)
+        # 非融合执行: gemm kernel → 写回 global → relu kernel 从 global 读取 → 写回
         def nonfused_relu():
             c = a @ b
             return torch.relu(c)
