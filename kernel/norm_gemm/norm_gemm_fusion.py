@@ -3,13 +3,13 @@ import tilelang
 import tilelang.language as T
 
 
-@tilelang.jit(pass_configs={"tl.disable_tma_lower": True})
+@tilelang.jit
 def norm_gemm_fusion(
     A,
     B,
-    block_M: int = 32,
-    block_N: int = 32,
-    block_K: int = 32,
+    block_M: int = 128,
+    block_N: int = 64,
+    block_K: int = 64,
     dtype: T.dtype = T.float16,
     accum_dtype: T.dtype = T.float32,
 ):
@@ -24,12 +24,10 @@ def norm_gemm_fusion(
         local = T.alloc_fragment((block_M, block_K), accum_dtype)
         A_powsum = T.alloc_fragment((block_M,), accum_dtype)
 
-        # ==========================================================
-        # Pass 1: compute scale[i] = rsqrt(mean(A[i,:]^2) + eps)
-        # ==========================================================
         num_k_step = T.ceildiv(K, block_K)
-        T.clear(local)
 
+        # Pass 1: accumulate x² across K, then reduce to per-row scale
+        T.clear(local)
         for k in T.Serial(num_k_step):
             T.copy(A[bx * block_M, k * block_K], A_shared)
             for i, j in T.Parallel(block_M, block_K):
@@ -39,15 +37,11 @@ def norm_gemm_fusion(
         for i in T.Parallel(block_M):
             A_powsum[i] = T.rsqrt(A_powsum[i] / K + 1e-5)
 
-        # ==========================================================
-        # Pass 2: normalized GEMM
-        # ==========================================================
+        # Pass 2: GEMM with post-scale (local reused as C_local)
         A_shared_2 = T.alloc_shared((block_M, block_K), dtype)
         B_shared = T.alloc_shared((block_K, block_N), dtype)
-        # C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
         T.clear(local)
-
-        for k in T.Pipelined(num_k_step, num_stages=3):
+        for k in T.Pipelined(num_k_step, num_stages=2):
             T.copy(A[bx * block_M, k * block_K], A_shared_2)
             T.copy(B[k * block_K, by * block_N], B_shared)
             T.gemm(A_shared_2, B_shared, local)
@@ -72,7 +66,7 @@ def ref_norm_gemm(x, w, eps=1e-5):
 # ============================================================
 # Main: correctness + performance benchmark
 # ============================================================
-def main(M=4096, N=4096, K=4096, block_M=32, block_N=32, block_K=32):
+def main(M=4096, N=4096, K=4096, block_M=128, block_N=64, block_K=64):
     dtype = torch.float16
     device = "cuda"
 
@@ -144,9 +138,9 @@ if __name__ == "__main__":
     parser.add_argument("--M", type=int, default=4096)
     parser.add_argument("--N", type=int, default=4096)
     parser.add_argument("--K", type=int, default=4096)
-    parser.add_argument("--block_M", type=int, default=32)
-    parser.add_argument("--block_N", type=int, default=32)
-    parser.add_argument("--block_K", type=int, default=32)
+    parser.add_argument("--block_M", type=int, default=128)
+    parser.add_argument("--block_N", type=int, default=64)
+    parser.add_argument("--block_K", type=int, default=64)
     args = parser.parse_args()
 
     main(
