@@ -412,7 +412,8 @@ try:
             B += BLOCK_K * stride_bk
 
         # ---- 融合 ReLU：在寄存器上就地计算（与 TileLang 版本对应） ----
-        acc = tl.math.relu(acc)
+        # Triton 没有 tl.math.relu，使用 tl.maximum(x, 0) 等价实现
+        acc = tl.maximum(acc, 0)
 
         # 写回 global memory
         C = C_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
