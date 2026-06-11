@@ -471,6 +471,8 @@ try:
 
         自动推导矩阵维度，计算 grid 大小，调用 Triton kernel。
         """
+        import torch
+
         M, K = a.shape
         _, N = b.shape
 
