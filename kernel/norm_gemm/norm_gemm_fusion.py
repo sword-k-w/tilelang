@@ -55,7 +55,60 @@ def norm_gemm_fusion(
 
 
 # ============================================================
-# Reference implementation (unfused)
+# Official TileLang RMSNorm (from examples/norm/rms_norm.py)
+# Loads one row per block into fragment — single-pass, no shared memory tiling.
+# ============================================================
+@tilelang.jit(pass_configs={"tl.disable_tma_lower": True})
+def rms_norm_only(A, blk_m: int = 1):
+    M, N = T.const("M, N")
+    dtype = T.float
+    A: T.Tensor((M, N), dtype)
+    B = T.empty((M, N), dtype)
+
+    with T.Kernel(T.ceildiv(M, blk_m), threads=128) as bx:
+        A_local = T.alloc_fragment((blk_m, N), dtype)
+        A_pow_local = T.alloc_fragment((blk_m, N), dtype)
+        A_powsum = T.alloc_fragment((blk_m,), dtype)
+
+        T.copy(A[bx * blk_m : (bx + 1) * blk_m, :], A_local)
+        for i, j in T.Parallel(blk_m, N):
+            A_pow_local[i, j] = A_local[i, j] * A_local[i, j]
+        T.reduce_sum(A_pow_local, A_powsum, dim=1)
+        for i in T.Parallel(blk_m):
+            A_powsum[i] = T.rsqrt(A_powsum[i] / N + 1e-12)
+        for i, j in T.Parallel(blk_m, N):
+            A_local[i, j] *= A_powsum[i]
+        T.copy(A_local, B[bx * blk_m : (bx + 1) * blk_m, :])
+
+    return B
+
+
+# ============================================================
+# Official TileLang GEMM (from examples/gemm/example_gemm.py)
+# ============================================================
+@tilelang.jit
+def gemm_only(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+    M, N, K = T.const("M, N, K")
+    A: T.Tensor((M, K), dtype)
+    B: T.Tensor((K, N), dtype)
+    C = T.empty((M, N), dtype)
+
+    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        A_shared = T.alloc_shared((block_M, block_K), dtype)
+        B_shared = T.alloc_shared((block_K, block_N), dtype)
+        C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+        T.clear(C_local)
+        for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+            T.copy(A[by * block_M, k * block_K], A_shared)
+            T.copy(B[k * block_K, bx * block_N], B_shared)
+            T.gemm(A_shared, B_shared, C_local)
+        T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return C
+
+
+# ============================================================
+# Reference implementation
 # ============================================================
 def ref_norm_gemm(x, w, eps=1e-5):
     """RMSNorm + GEMM in PyTorch (non-fused)."""
@@ -103,25 +156,44 @@ def main(M=4096, N=4096, K=4096, block_M=128, block_N=64, block_K=64):
     # ---- Performance ----
     from tilelang.profiler import do_bench
 
+    # Compile official TileLang standalone kernels
+    # RMSNorm: official version uses blk_m=1 (one row per block, loads full row into fragment)
+    rms_kernel = rms_norm_only.compile(M=M, N=K, blk_m=1)
+    # GEMM: same block sizes as fused kernel for fair comparison
+    gemm_kernel = gemm_only.compile(
+        M=M,
+        N=N,
+        K=K,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+    )
+
     profiler = kernel.get_profiler()
     latency_fused = profiler.do_bench(warmup=25, rep=100)
+    # Official RMSNorm uses fp32, pass float input
+    latency_rms_tl = rms_kernel.get_profiler().do_bench(warmup=25, rep=100)
+    latency_gemm_tl = gemm_kernel.get_profiler().do_bench(warmup=25, rep=100)
 
     # PyTorch baselines
     def ptx_rmsnorm(xx):
         return xx * torch.rsqrt(xx.float().pow(2).mean(-1, keepdim=True) + 1e-5).half()
 
-    latency_rms = do_bench(lambda: ptx_rmsnorm(x), warmup=25, rep=100)
-    latency_mm = do_bench(lambda: x @ w, warmup=25, rep=100)
-    latency_unfused = do_bench(lambda: ptx_rmsnorm(x) @ w, warmup=25, rep=100)
+    latency_rms_pt = do_bench(lambda: ptx_rmsnorm(x), warmup=25, rep=100)
+    latency_mm_pt = do_bench(lambda: x @ w, warmup=25, rep=100)
+    latency_unfused_pt = do_bench(lambda: ptx_rmsnorm(x) @ w, warmup=25, rep=100)
 
     print("\n--- Performance (ms) ---")
-    print(f"TileLang RMSNorm+GEMM (fused):  {latency_fused:.4f} ms")
-    print(f"PyTorch  RMSNorm only:           {latency_rms:.4f} ms")
-    print(f"PyTorch  GEMM only:              {latency_mm:.4f} ms")
-    print(f"PyTorch  RMSNorm+GEMM (non-fus): {latency_unfused:.4f} ms")
-    print(f"PyTorch  Non-Fused sum:          {latency_rms + latency_mm:.4f} ms")
-    print(f"Speedup vs PyTorch non-fused:    {latency_unfused / latency_fused:.2f}x")
-    print(f"Speedup vs sum:                  {(latency_rms + latency_mm) / latency_fused:.2f}x")
+    print(f"TileLang Fused:     RMSNorm+GEMM  {latency_fused:.4f} ms")
+    print(f"TileLang Non-Fused: RMSNorm only  {latency_rms_tl:.4f} ms")
+    print(f"TileLang Non-Fused: GEMM only     {latency_gemm_tl:.4f} ms")
+    print(f"TileLang Non-Fused: sum           {latency_rms_tl + latency_gemm_tl:.4f} ms")
+    print(f"PyTorch:            RMSNorm only  {latency_rms_pt:.4f} ms")
+    print(f"PyTorch:            GEMM only     {latency_mm_pt:.4f} ms")
+    print(f"PyTorch:            RMSNorm+GEMM  {latency_unfused_pt:.4f} ms")
+    print(f"PyTorch:            Non-Fus sum   {latency_rms_pt + latency_mm_pt:.4f} ms")
+    print(f"Speedup vs TileLang non-fused:    {(latency_rms_tl + latency_gemm_tl) / latency_fused:.2f}x")
+    print(f"Speedup vs PyTorch non-fused:     {latency_unfused_pt / latency_fused:.2f}x")
 
     # ---- CUDA source ----
     print("\nGenerated CUDA source saved to: /tmp/norm_gemm_fusion.cu")
