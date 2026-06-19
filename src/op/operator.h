@@ -10,6 +10,9 @@
 // Dependencies for operators
 #include "support/check.h"
 #include <array>
+#include <functional>
+#include <optional>
+#include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/op.h>
 #include <tvm/target/target.h>
@@ -29,8 +32,15 @@ using namespace tirx;
 using namespace ffi;
 
 using AddWorkspaceCallback = std::function<PrimExpr(int, DataType)>;
-using AllocMBarrierCallback = std::function<int(int arrive_count)>;
+// Allocate a compiler-generated shared mbarrier slot. The optional hint names
+// the backing barrier buffer when the first slot is created; later slots share
+// the same buffer and may ignore the hint.
+using AllocMBarrierCallback =
+    std::function<int(int arrive_count, std::optional<std::string> name)>;
 using UpdateBarrierArriveCallback = std::function<void(Var, PrimExpr)>;
+// Record a minimum shared-memory base alignment (bytes) required for the
+// buffer backed by the given data Var (e.g. TMA/MMA swizzle constraints).
+using RequireSmemAlignmentCallback = std::function<void(Var, int)>;
 using LayoutMap = Map<Buffer, Layout>;
 using BufferMap = Map<Var, Buffer>;
 
@@ -88,9 +98,6 @@ struct LowerArgs {
   Target target;
   Range thread_bounds;
   Var thread_var;
-  AddWorkspaceCallback AddWorkspace;
-  AllocMBarrierCallback AllocMBarrier;
-  UpdateBarrierArriveCallback UpdateBarrierArrive;
   LayoutMap layout_map;
   Map<Buffer, Buffer> buffer_remap;
   // Map from Bind variable to its bound expression, for resolving
@@ -103,12 +110,24 @@ struct LowerArgs {
   PrimExpr mbar_phase_expr = IntImm(DataType::Int(32), 0);
   // Pointer to the shared.barrier buffer for compiler-generated mbarriers.
   // Points to the LowerTileOpPass member so copy.cc sees the buffer
-  // even when created lazily by the AllocMBarrier callback.
+  // even when created lazily by the alloc_mbarrier callback.
   Optional<Buffer> *mbarrier_buffer = nullptr;
   // Product of cluster_dims (from block annotation). Defaults to 1 (no
   // cluster). Used by TMA copy lowering to scale expect_tx bytes for cluster
   // barriers.
   int cluster_size = 1;
+
+  // Callbacks used by op lowerings to request pass-owned resources or report
+  // metadata that later passes need.
+  AddWorkspaceCallback add_workspace = nullptr;
+  AllocMBarrierCallback alloc_mbarrier = nullptr;
+  UpdateBarrierArriveCallback update_barrier_arrive = nullptr;
+  // Optional callback to record a minimum shared-memory base alignment for a
+  // buffer's data Var. Lowerings that bind a buffer to a swizzle-sensitive
+  // instruction (TMA bulk copy, wgmma/tcgen05 descriptors) report the
+  // alignment implied by the chosen swizzle mode here; LowerTileOp collects
+  // the results into the kSmemAlignmentMap PrimFunc attribute.
+  RequireSmemAlignmentCallback require_smem_alignment = nullptr;
 };
 
 struct LayoutInferArgs {
