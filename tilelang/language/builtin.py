@@ -8,13 +8,10 @@ from tilelang import tvm as tvm
 from tilelang.language import ptx_arrive_barrier, evaluate
 from tilelang.language.eager.builder import macro
 from tilelang.language.kernel import get_thread_bindings, get_block_extents
-from tilelang.utils.target import check_hip_availability
 from tvm import DataType, tirx
 from tvm.runtime import convert
 from tvm.tirx import PrimExpr, Var, Call, BufferLoad, BufferRegion
 from tilelang.utils.language import retrieve_ptr, get_buffer_region_from_load, retrieve_buffer_and_offset
-
-_IS_HIP_AVAILABLE = check_hip_availability()
 
 
 def _normalize_index_arg(value: int | PrimExpr | None) -> PrimExpr | None:
@@ -358,20 +355,23 @@ def tma_store_arrive():
     return tirx.call_intrin("handle", tirx.op.Op.get("tl.tma_store_arrive"))
 
 
-def tma_store_wait(count: int = 0):
+def tma_store_wait(count: int = 0, read: bool = True):
     """Wait for completion of TMA store operations.
 
     Waits until the number of outstanding TMA store groups is at most ``count``.
-    Maps to the PTX instruction ``cp.async.bulk.wait_group.read <count>``.
+    Maps to ``cp.async.bulk.wait_group.read <count>`` by default, or
+    ``cp.async.bulk.wait_group <count>`` when ``read`` is false.
 
     Args:
         count (int): The maximum number of outstanding store groups allowed
             to remain in flight. Defaults to 0 (wait for all stores to complete).
+        read (bool): Whether to use the PTX ``.read`` modifier, which only
+            waits for the source reads to complete. Defaults to True.
 
     Returns:
         tirx.Call: A handle to the store wait operation
     """
-    return tirx.call_intrin("handle", tirx.op.Op.get("tl.tma_store_wait"), count)
+    return tirx.call_intrin("handle", tirx.op.Op.get("tl.tma_store_wait"), count, read)
 
 
 def set_max_nreg(reg_count: int, is_inc: int):
@@ -519,7 +519,7 @@ def mbarrier_expect_tx(mbarrier: BarrierType, tx: int):
 
 def mbarrier_arrive_expect_tx(mbarrier: BarrierType, tx: int):
     """Arrive at a memory barrier and expect completion of async transactions."""
-    from tilelang.language.tirx.op import ptx_arrive_barrier_expect_tx
+    from tilelang.language.tir.op import ptx_arrive_barrier_expect_tx
 
     mbarrier = _mbar_to_buffer_load(mbarrier)
     return ptx_arrive_barrier_expect_tx(mbarrier, tx)
