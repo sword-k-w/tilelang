@@ -7,7 +7,7 @@ import tilelang.language as T
 def norm_gemm_fusion(
     A,
     B,
-    block_M: int = 128,
+    block_M: int = 256,
     block_N: int = 64,
     block_K: int = 64,
     dtype: T.dtype = T.float16,
@@ -119,7 +119,7 @@ def ref_norm_gemm(x, w, eps=1e-5):
 # ============================================================
 # Main: correctness + performance benchmark
 # ============================================================
-def main(M=4096, N=4096, K=4096, block_M=128, block_N=64, block_K=64):
+def main(M=8192, N=8192, K=8192, block_M=256, block_N=64, block_K=64):
     dtype = torch.float16
     device = "cuda"
 
@@ -207,10 +207,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="RMSNorm + GEMM Fusion")
-    parser.add_argument("--M", type=int, default=4096)
-    parser.add_argument("--N", type=int, default=4096)
-    parser.add_argument("--K", type=int, default=4096)
-    parser.add_argument("--block_M", type=int, default=128)
+    parser.add_argument("--M", type=int, default=8192)
+    parser.add_argument("--N", type=int, default=8192)
+    parser.add_argument("--K", type=int, default=8192)
+    parser.add_argument("--block_M", type=int, default=256)
     parser.add_argument("--block_N", type=int, default=64)
     parser.add_argument("--block_K", type=int, default=64)
     args = parser.parse_args()
