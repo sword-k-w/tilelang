@@ -73,15 +73,41 @@ Pass 2 (T.Pipelined): 标准分块 GEMM，利用 scale 对输出做 post-scale
 2. **PipelinePlanning 冲突：** Pipelined 循环中 Stage 0（copy）和 Stage 1（compute）不能同时写入同一个 shared memory buffer。解决方案是将 Norm 操作放在 Pipelined 循环外（post-scale）。
 3. **atomic_add 性能：** 尝试用 shared memory + atomic 代替 2D fragment 做 x² 累加，但大量原子操作导致 102ms 延迟（vs 8ms）。
 
-#### 性能结果
+#### 性能结果（4096²）
 
-| 矩阵大小 | TileLang Fused | PyTorch Unfused | Speedup |
-|---------|---------------|----------------|---------|
-| 512² | **0.0435 ms** | 0.0573 ms | **1.32×** |
-| 4096² | **8.24 ms** | 6.85 ms | **0.83×** |
+Baseline 使用 TileLang 官方示例实现：`examples/norm/rms_norm.py`（`blk_m=1`，整行加载）和 `examples/gemm/example_gemm.py`（`block_M=128, block_N=64, block_K=64`，与融合版本使用相同块大小以公平对比）。
 
-- **小矩阵（512²）：** 融合有效，省去的 Global Memory 读写（1 写 + 1 读）占主导 → 1.32× 加速
-- **大矩阵（4096²）：** 融合收益（~1.6ms）被 GEMM 效率差距（~2ms）抵消。根因是 `block_K=64` 导致 Shared Memory 占用 48KB（达到 RTX 4060 Laptop 上限），Occupancy 降至 2 blocks/SM，而 cuBLAS 可达 3 blocks/SM
+Baseline 使用 TileLang 官方示例实现：`examples/norm/rms_norm.py`（`blk_m=1`，整行加载到 fragment）和 `examples/gemm/example_gemm.py`（`block_M=128, block_N=64, block_K=64`，与融合版本相同块大小以公平对比）。
+
+#### 性能结果（4096²）
+
+| 实现 | 延迟 (ms) |
+|------|----------|
+| **TileLang Fused (RMSNorm+GEMM)** | **7.97** |
+| TileLang Official RMSNorm | 0.60 |
+| TileLang Official GEMM | 6.40 |
+| TileLang Non-Fused sum | 7.00 |
+| PyTorch RMSNorm | 1.64 |
+| PyTorch GEMM (cuBLAS) | 5.07 |
+| PyTorch Non-Fused | 6.72 |
+
+**Speedup:**
+- vs TileLang Non-Fused sum: **0.88×**（接近持平，融合开销 ≈ 省下的带宽）
+- vs PyTorch Non-Fused: **0.84×**（差距来自 GEMM 效率）
+
+#### 关键发现
+
+- **官方 TileLang RMSNorm (0.60ms) 比 PyTorch (1.64ms) 快 2.7×。** 一次 `T.copy` 将整行加载到 fragment、单 pass 完成归一化的策略非常高效。
+- **官方 TileLang GEMM (6.40ms) 比 PyTorch cuBLAS (5.07ms) 慢 26%。** 因为公平对比使用 `block_N=64`（受融合版 `block_K==block_N` 约束），cuBLAS 使用 `block_N=128` 并有更高 Occupancy。
+- **融合 (7.97ms) vs 官方分开跑 (7.00ms) = 0.88×。** 融合省去了中间矩阵的 Global Memory 写+读（32MB），但融合 kernel 的 Shared Memory 压力（48KB vs 32KB）导致 GEMM 部分 Occupancy 下降，两者大致抵消。
+
+| 矩阵大小 | TileLang Fused | TileLang Sum | PyTorch | Fused vs TL Sum | Fused vs PyTorch |
+|---------|---------------|-------------|---------|----------------|-----------------|
+| 512² | 0.044 ms | 0.042 ms | 0.057 ms | 0.95× | **1.30×** |
+| 4096² | 7.97 ms | 7.00 ms | 6.72 ms | 0.88× | 0.84× |
+
+- **小矩阵（512²）：** 融合 vs PyTorch = 1.30×。Memory-bound 场景省带宽收益显著。vs TileLang 分开跑接近持平。
+- **大矩阵（4096²）：** 融合 vs PyTorch 仍有差距，根因是 RTX 4060 Laptop 48KB Shared Memory 上限导致的 Occupancy 瓶颈（2 vs 3 blocks/SM）。
 
 #### 探索过的替代方案
 
@@ -113,7 +139,11 @@ Pass 2 (T.Pipelined): 标准分块 GEMM，利用 scale 对输出做 post-scale
 kernel/
 ├── README.md                         # 本报告
 └── norm_gemm/
-    └── norm_gemm_fusion.py           # RMSNorm + GEMM 融合实现
+    └── norm_gemm_fusion.py           # 融合 + 官方 baseline + 性能测试
+        ├── norm_gemm_fusion()        # RMSNorm + GEMM 融合（本地实现）
+        ├── rms_norm_only()           # 官方 TileLang RMSNorm（examples/norm/rms_norm.py）
+        ├── gemm_only()               # 官方 TileLang GEMM（examples/gemm/example_gemm.py）
+        └── main()                    # 正确性验证 + 五维度性能对比
 ```
 
 ---
