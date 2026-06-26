@@ -20,7 +20,7 @@
 
 1. 使用 Level 2 抽象（分块 + 共享内存）实现 GEMM 算子的编译与正确性验证
 2. 实现算子融合（Norm + GEMM 及 GEMM + Activation），与 CUDA / Triton / PyTorch 做多维度性能对比
-3. 各自实现一种 Attention 算子（如 Flash Attention / Online Softmax Attention 等）
+3. 各自实现一种 Flash Attention 算子（MHA / GQA）
 4. 使用 TileLang 内置自动调优工具，对分块参数进行搜索，获得性能对比数据
 
 参考对象：TileLang 官方教程及算子示例（https://github.com/tile-ai/tilelang）
@@ -174,45 +174,268 @@ python examples/gemm/example_gemm.py
 
 ---
 
-## 阶段三：Attention 算子实现（6/16 – 6/22）
+## 阶段三：Flash Attention 算子实现
 
-目标：两位同学各自选择一种 Attention 算子，基于 TileLang 实现并做性能对比。
+目标：两位同学各实现一种 Flash Attention 变体，基于 TileLang 从零编写、理解算法原理、对比性能。
 
-### Attention 候选列表（各选一种）
+### 选题分配
 
-| Attention 类型 | 难度 | 参考文件 | 说明 |
-|---------------|------|---------|------|
-| Online Softmax Attention | 中等 | `examples/online_softmax/online_softmax.py` | 基于 online softmax 的 safe attention，阶段一已学过 |
-| Flash Attention 1 | 较高 | `examples/flash_attention/` | 分块 + 重计算，避免 O(N²) 中间矩阵写回 HBM |
-| Flash Attention 2 | 高 | `examples/flash_attention/` | 在 FA1 基础上增加 causal mask 和更好的 warp 调度 |
-| Flash Linear Attention | 较高 | 需自行调研 | 线性注意力，适合长序列场景 |
-| Sparse Attention | 高 | 需自行调研 | 块稀疏 / sliding window 等变体 |
+| 同学 | 选题 | Layout | 参考文件 | 说明 |
+|------|------|--------|---------|------|
+| 同学 A（Norm+GEMM） | **Flash Attention — MHA Forward** | BHSD `[batch, heads, seq, dim]` | `examples/flash_attention/example_mha_fwd_bhsd.py` | 标准多头注意力，每个 Q head 对应一个 KV head |
+| 同学 B（GEMM+Activation） | **Flash Attention — GQA Forward** | BSHD `[batch, seq, heads, dim]` | `examples/flash_attention/example_gqa_fwd_bshd.py` | 分组查询注意力（Llama/Mistral 实际使用的模式），KV heads < Q heads |
 
-### 实现要求
+> **为什么不选其他 Attention？**
+> - Online Softmax Attention：现有例子仅做 softmax，做完整 attention 等同于重新推导 FA1，不如直接做 FA1。
+> - Flash Attention 2：改进在 warp 调度和寄存器分配，属于编译器/调度器层面，TileLang DSL 层面无法体现区别。
+> - Linear / Sparse Attention：数学基础不同，调试困难，且 baseline 难以选择。
 
-- 基于 TileLang 自主实现所选 Attention 算子的 forward pass（选做 backward）
-- 核心模式：分块 softmax → rescale → 累加输出，使用 `T.Pipelined` 或 `T.Serial` 沿序列维度循环
-- 理解 Attention 的访存瓶颈：QK^T 产生 `[seq_len, seq_len]` 中间矩阵，Flash Attention 通过分块避免将其写回 HBM
+### 阶段三A：同学 A — MHA Flash Attention Forward
 
-### 实验方案
+#### 3A.1 算法原理（理解后再写代码）
 
-1. 固定 head_dim，测试不同序列长度（512/1024/2048/4096）
-2. 性能对比（至少 3 条线）：
-   - TileLang Attention
-   - PyTorch 原生（`F.scaled_dot_product_attention` 或手动实现）
-   - Triton 实现（参考开源 Flash Attention Triton 版本）
-3. 可选对比 CUDA 实现（如 `flash_attn` 库）
-4. 分析不同序列长度下的带宽利用率和计算强度
+Flash Attention 的核心思想：**将 softmax 计算分解为分块 online 更新，避免 O(N²) 的注意力矩阵写回 HBM**。
 
-### 阶段三交付物
+标准 Attention：
+```
+S = Q @ K^T          # [seq, seq] ← 这个矩阵是瓶颈
+P = softmax(S)
+O = P @ V
+```
 
-- [ ] Attention 算子 forward pass 可运行，与 PyTorch 误差在 `rtol=1e-2` 以内
-- [ ] 不同序列长度的性能对比表格 + 折线图
-- [ ] 与 PyTorch / Triton 的延迟对比及 speedup
+Flash Attention 将 Q 按行分块（`block_M`），K/V 按列分块（`block_N`），在外循环迭代 KV 块时维护三个 running state：
+
+- `acc_o[i]` — 当前行的部分输出累加（fp32）
+- `scores_max[i]` — 当前行的 running max（用于数值稳定性）
+- `logsum[i]` — 当前行的 running sum（用于最终归一化）
+
+对每个新的 KV 块：
+1. 计算局部 `S_block = Q_block @ K_block^T`
+2. 更新 `scores_max_new = max(scores_max_old, rowmax(S_block))`
+3. 计算 rescale 因子：`scale = exp(scores_max_old - scores_max_new)`
+4. 用 `scale` 修正旧的 `acc_o`：`acc_o *= scale`
+5. 计算局部 softmax：`P_block = exp(S_block - scores_max_new)`
+6. 累加输出：`acc_o += P_block @ V_block`
+7. 更新 `logsum_new = logsum_old * scale + rowsum(P_block)`
+
+循环结束后：`Output = acc_o / logsum`
+
+**关键洞察**：整个过程 Q 块只加载一次，K/V 块在循环中依次流经 shared memory，`S` 矩阵（`[block_M, block_N]`）始终在寄存器中——**永远不会写出 `[seq, seq]` 的完整注意力矩阵到 HBM**。
+
+#### 3A.2 TileLang 实现要点
+
+**Layout & Indexing（BHSD）**：
+```python
+q_shape = [batch, heads, seq_q, dim]   # BHSD
+kv_shape = [batch, heads, seq_kv, dim]  # BHSD
+
+# Kernel 3D grid: (seq_q 分块, heads, batch)
+with T.Kernel(T.ceildiv(seq_q, block_M), heads, batch, threads=threads) as (bx, by, bz):
+    # Q 块索引: bz=batch, by=head, bx=seq_q_block
+    T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
+    # K 块索引: bz=batch, by=head, k=seq_kv_block
+    T.copy(K[bz, by, k * block_N : (k + 1) * block_N, :], K_shared)
+```
+
+**内存分配**：
+| Buffer | 位置 | Shape | dtype | 用途 |
+|--------|------|-------|-------|------|
+| `Q_shared` | Shared Mem | `[block_M, dim]` | fp16 | Q 块缓存 |
+| `K_shared` | Shared Mem | `[block_N, dim]` | fp16 | K 块缓存（流水线中重用） |
+| `V_shared` | Shared Mem | `[block_N, dim]` | fp16 | V 块缓存（流水线中重用） |
+| `O_shared` | Shared Mem | `[block_M, dim]` | fp16 | 输出写回缓冲（保证合并写） |
+| `acc_s` | Register | `[block_M, block_N]` | fp32 | 局部注意力分数 S |
+| `acc_s_cast` | Register | `[block_M, block_N]` | fp16 | S 的 fp16 版本（给 V gemm 用） |
+| `acc_o` | Register | `[block_M, dim]` | fp32 | 输出累加器 |
+| `scores_max` | Register | `[block_M]` | fp32 | 每行当前最大值 |
+| `scores_max_prev` | Register | `[block_M]` | fp32 | 上一轮最大值 |
+| `scores_scale` | Register | `[block_M]` | fp32 | rescale 因子 |
+| `scores_sum` | Register | `[block_M]` | fp32 | 每行局部 softmax sum |
+| `logsum` | Register | `[block_M]` | fp32 | 每行 running log-sum |
+
+**核心循环结构**：
+```python
+T.copy(Q[...], Q_shared)
+T.fill(acc_o, 0)
+T.fill(logsum, 0)
+T.fill(scores_max, -T.infinity(accum_dtype))
+
+for k in T.Pipelined(num_kv_blocks, num_stages=2):
+    T.copy(K[...], K_shared)         # Stage 1: 加载 K
+
+    # QK^T → acc_s，结果在寄存器中
+    T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+    # Online Softmax rescaling
+    T.copy(scores_max, scores_max_prev)
+    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+    for i in T.Parallel(block_M):
+        scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+        scores_scale[i] = T.exp2(scores_max_prev[i] - scores_max[i])
+    for i, j in T.Parallel(block_M, dim):
+        acc_o[i, j] *= scores_scale[i]
+    for i, j in T.Parallel(block_M, block_N):
+        acc_s[i, j] = T.exp2(acc_s[i, j] - scores_max[i])
+
+    T.copy(acc_s, acc_s_cast)        # fp32 → fp16 cast
+    T.copy(V[...], V_shared)         # Stage 2: 加载 V
+    T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+    T.reduce_sum(acc_s, scores_sum, dim=1)
+    for i in T.Parallel(block_M):
+        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+
+# 最终归一化 + 写回
+for i, j in T.Parallel(block_M, dim):
+    acc_o[i, j] /= logsum[i]
+T.copy(acc_o, O_shared)
+T.copy(O_shared, Output[...])
+```
+
+**关键 API 说明**：
+- `T.gemm(..., transpose_B=True)` — K 需要转置，Q[block_M,dim] × K^T[dim,block_N] → S[block_M,block_N]
+- `policy=T.GemmWarpPolicy.FullRow` — 每个 warp 负责一整行，适合 attention 中 block_N 较小的情况
+- `num_stages=2` — 双缓冲流水线：加载下一个 K 块的同时计算当前 V 的 gemm
+- `scale = (1.0 / dim) ** 0.5 * 1.44269504` — 用 `exp2/log2` 替代 `exp/log`，因子 `1.44269504 = log2(e)` 用于换底；硬件上 `exp2` 比 `exp` 快
+- `T.exp2(x)` 返回 fp32，无论输入类型
+
+#### 3A.3 参考 baseline
+
+| Baseline | 实现方式 |
+|----------|---------|
+| PyTorch native | `F.scaled_dot_product_attention(Q, K, V)` — PyTorch 2.0+ 自动调用 cuDNN Flash Attention |
+| PyTorch manual | `einsum + softmax + einsum`（无融合，用于展示融合收益） |
+| Triton | 参考 [Triton Fused Attention Tutorial](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html) |
+| flash_attn (可选) | `pip install flash-attn`，调用 `flash_attn_func(Q, K, V)` |
 
 ---
 
-## 阶段四：实验总结与报告撰写（6/23 – 6/28）
+### 阶段三B：同学 B — GQA Flash Attention Forward
+
+#### 3B.1 算法原理
+
+Grouped Query Attention (GQA) 与 MHA 的区别：**KV heads 数量少于 Q heads 数量**，多个 Q heads 共享同一组 KV heads。
+
+```
+MHA:   Q_heads = 32,  KV_heads = 32   →  每个 Q head 对应一个 KV head
+GQA:   Q_heads = 32,  KV_heads = 8    →  每 4 个连续的 Q heads 共享一个 KV head
+```
+
+这是 **Llama 2 70B、Llama 3、Mistral、Qwen** 等实际部署的大模型使用的模式。好处：减少 KV cache 大小，几乎不影响模型质量。
+
+在 TileLang 中的核心变化——KV 的索引按 `kv_head = q_head // num_groups` 映射：
+
+```python
+num_groups = heads // kv_heads   # 例如 32 // 8 = 4
+
+with T.Kernel(T.ceildiv(seq_q, block_M), heads, batch, threads=threads) as (bx, by, bz):
+    kv_head = by // num_groups   # Q head "by" 映射到对应的 KV head
+    T.copy(Q[bz, by, seq_start:seq_end, :], Q_shared)
+    T.copy(K[bz, kv_head, k_start:k_end, :], K_shared)   # ← 注意 kv_head 索引
+    T.copy(V[bz, kv_head, k_start:k_end, :], V_shared)
+```
+
+除此之外，online softmax 的 rescaling 逻辑与 MHA 完全一致。
+
+#### 3B.2 TileLang 实现要点
+
+**Layout（BSHD）**：
+```python
+q_shape = [batch, seq_q, heads, dim]       # BSHD
+kv_shape = [batch, seq_kv, kv_heads, dim]  # BSHD, 注意 kv_heads < heads
+
+# Kernel 3D grid: (seq_q 分块, heads, batch)
+# by 遍历所有 Q heads，kv_head 通过 by // num_groups 计算
+with T.Kernel(T.ceildiv(seq_q, block_M), heads, batch, threads=threads) as (bx, by, bz):
+    kv_head = by // num_groups
+    T.copy(Q[bz, bx * block_M : (bx+1) * block_M, by, :], Q_shared)
+    T.copy(K[bz, k * block_N : (k+1) * block_N, kv_head, :], K_shared)
+```
+
+**与 MHA 的差异总结**：
+
+| 方面 | MHA (同学 A) | GQA (同学 B) |
+|------|-------------|-------------|
+| Layout | BHSD | BSHD |
+| KV head 数量 | = Q heads | < Q heads |
+| KV 索引 | `by` | `by // num_groups` |
+| Q 索引 | `[bz, by, ...]` | `[bz, ..., by]` |
+| 实际意义 | 教科书式 | 工业部署实际使用 |
+| bonus | — | 可加 causal mask 实现 decoder 模式 |
+
+#### 3B.3 Causal Mask（加分项）
+
+GQA 通常用于自回归解码，加上 causal mask 更有实际意义：
+
+```python
+# 在 Pipelined 循环内，gemm 之前：
+if is_causal:
+    for i, j in T.Parallel(block_M, block_N):
+        q_idx = bx * block_M + i
+        k_idx = k * block_N + j
+        acc_s[i, j] = T.if_then_else(q_idx >= k_idx, 0, -T.infinity(acc_s.dtype))
+```
+
+加上 causal mask 后循环上界也可以优化——Q 的第 `bx` 块只需要关注 `k_idx <= q_idx_max` 的 KV 块（后面的块全是 masked）。
+
+---
+
+### 实验方案（两人共用）
+
+#### 测试矩阵
+
+```python
+batch_sizes = [1, 2]
+seq_lens = [512, 1024, 2048, 4096]
+head_dims = [64, 128]
+# 同学 A (MHA):  heads = 32
+# 同学 B (GQA):  heads = 32, kv_heads = 8
+```
+
+#### 性能对比（至少 4 条线）
+
+| # | 名称 | 说明 |
+|---|------|------|
+| 1 | **TileLang Flash Attn** | 你的实现 |
+| 2 | **PyTorch sdpa** | `F.scaled_dot_product_attention(Q, K, V)` — PyTorch 内置 flash attention |
+| 3 | **PyTorch manual** | `einsum("bhqd,bhkd->bhqk", Q, K) → softmax → einsum("bhqk,bhkd->bhqd", ...)` — 无融合，用于展示融合收益 |
+| 4 | **Triton** | 参考 [Triton Flash Attention Tutorial](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html)，适配到你的 shape |
+| 5 | **flash_attn** (可选) | `pip install flash-attn` → `flash_attn_func(Q, K, V)` — 手写 CUDA 天花板 |
+
+#### 调参建议
+
+```python
+# 推荐参数搜索空间（阶段四用 autotune，阶段三先手动试）
+block_M = [64, 128]        # Q 行分块大小
+block_N = [64, 128]        # KV 列分块大小
+num_stages = [1, 2, 3]     # 软件流水线深度
+threads = [128, 256]       # 每 block 线程数
+```
+
+- 长序列（≥2048）：大的 `block_M`（128）减少循环迭代次数
+- 短序列（512）：小的 `block_M`（64）提高 occupancy
+- `num_stages=2` 通常是最优平衡点（双缓冲，不明显增加 shared memory 压力）
+
+#### 分析维度
+
+1. **延迟 vs 序列长度**：画出 seq_len 从 512→4096 的延迟曲线，分析复杂度是 O(N²) 还是接近 O(N)（Flash Attention 在带宽-bound 区间接近线性）
+2. **融合收益**：对比 PyTorch manual（无融合，O(N²) 中间矩阵写回 HBM）的延迟，量化融合减少的 HBM 读写量
+3. **计算强度**（选修）：roofline model 分析——不同 seq_len 下是计算受限还是带宽受限
+
+---
+
+### 阶段三交付物
+
+- [ ] 同学 A：MHA Flash Attention forward pass 可运行，与 `F.scaled_dot_product_attention` 误差 `rtol=1e-2, atol=1e-2`
+- [ ] 同学 B：GQA Flash Attention forward pass 可运行，与 `F.scaled_dot_product_attention`（手动处理 head mapping）误差 `rtol=1e-2, atol=1e-2`
+- [ ] 不同序列长度（512/1024/2048/4096）的性能对比表格 + 折线图（4-5 条线）
+- [ ] 与 PyTorch manual（无融合）的对比，展示 Flash Attention 避免 O(N²) 中间矩阵的收益
+- [ ] 导出生成的 CUDA 源码到文件，报告中引用关键代码段
+- [ ] 可选：causal mask 版本 + 性能对比
+
+---
+
+## 阶段四：实验总结与报告撰写
 
 > 暂未确定具体分工，以下为初步框架。
 
@@ -224,7 +447,7 @@ python examples/gemm/example_gemm.py
 - **方法**：TileLang 的分块抽象、软件流水线、tensor core 调度
 - **实现细节**：
   - 阶段二的融合算子实现（Norm + GEMM 或 GEMM + Activation），内存优化原理
-  - 阶段三的 Attention 实现，分块 softmax / Flash Attention 的访存优化
+  - 阶段三的 Flash Attention 实现（MHA / GQA），online softmax 分块 + rescaling 的访存优化原理
 - **性能图表**：融合 vs 非融合 vs 多后端对比（柱状图）、Attention 不同序列长度对比（折线图）
 
 推荐使用 matplotlib/seaborn 绘图（已在 `requirements-test.txt` 中）：
@@ -258,7 +481,7 @@ plt.savefig("fusion_backend_comparison.png", dpi=150)
 - 完整的项目代码：
   - 阶段二：`norm_gemm_fusion.py`（同学 A）、`gemm_activation_fusion.py`（同学 B）
   - 阶段二：CUDA / Triton baseline 脚本
-  - 阶段三：`xxx_attention.py`（各自实现）
+  - 阶段三：`mha_flash_attention.py`（同学 A）、`gqa_flash_attention.py`（同学 B）
   - 性能测试脚本 + 绘图脚本
 - 项目报告（含性能图表）
 - 可选：PPT / Poster
