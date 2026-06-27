@@ -493,6 +493,7 @@ def analyze_results(results):
         gelu_cublas = results.get(("cuBLAS", "GELU", size), 0)
 
         print(f"| {size:<8} | {relu_f:<14.4f} | {relu_nf:<11.4f} | {relu_cublas:<12.4f} | {gelu_f:<14.4f} | {gelu_nf:<11.4f} | {gelu_cublas:<12.4f} |")
+<<<<<<< HEAD
 
 
 def plot_results(results, output_path=None):
@@ -596,6 +597,8 @@ def plot_results(results, output_path=None):
 
     print(f"\n性能图已保存到: {output_path}")
     return output_path
+=======
+>>>>>>> gemm_activation
 
 
 def main():
