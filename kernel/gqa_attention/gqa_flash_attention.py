@@ -375,9 +375,10 @@ def main(
     V = torch.randn(batch, seq_len, kv_heads, dim, device=device, dtype=dtype)
 
     # ---- Compile TileLang kernel (tuned or direct) ----
-    # Defaults used for the official baseline. When --tune is on, we INTENTIONALLY
-    # keep the official at these defaults so the comparison surfaces the autotune
-    # speedup. (Same algorithm at the same tile config would otherwise tie 1.00x.)
+    # When --tune is on, both my kernel AND the official baseline are autotuned
+    # (the official's @autotune fires only when tile kwargs are NOT passed).
+    # When --tune is off, both run at the user-CLI defaults for an apples-to-apples
+    # comparison on the same config.
     official_block_M, official_block_N = block_M, block_N
     official_num_stages, official_threads = num_stages, threads
 
@@ -395,13 +396,9 @@ def main(
         best_cfg = getattr(kernel, "config", None)
         best_lat = getattr(kernel, "latency", None)
         if best_cfg is not None:
-            print(f"\n[AUTOTUNE] Best config: {best_cfg}")
-            print(f"[AUTOTUNE] Official baseline kept at defaults "
-                  f"(block_M={official_block_M}, block_N={official_block_N}, "
-                  f"num_stages={official_num_stages}, threads={official_threads}) "
-                  f"to expose the tuning gain.")
+            print(f"\n[AUTOTUNE] My best config: {best_cfg}")
         if best_lat is not None:
-            print(f"[AUTOTUNE] Best latency during search: {best_lat:.4f} ms")
+            print(f"[AUTOTUNE] My best latency during search: {best_lat:.4f} ms")
     else:
         kernel = gqa_flash_attn(
             batch=batch,
@@ -438,20 +435,67 @@ def main(
     # ---- Performance ----
     num_groups = heads // kv_heads
 
-    # Compile TileLang's official GQA Flash Attention with matching params
-    # The official API uses `groups` (Q heads per KV head) instead of `kv_heads`
-    kernel_official = official_gqa_flashattn(
-        batch,
-        heads,
-        seq_len,
-        dim,
-        is_causal,
-        groups=num_groups,
-        block_M=official_block_M,
-        block_N=official_block_N,
-        num_stages=official_num_stages,
-        threads=official_threads,
-    )
+    # Compile TileLang's official GQA Flash Attention.
+    # The official API uses `groups` (Q heads per KV head) instead of `kv_heads`.
+    # When `tune=True`, we OMIT tile-size kwargs so the official's own @autotune
+    # decorator actually searches — otherwise providing all tunables triggers the
+    # "Tunable parameters already provided ... Skipping compilation" path and
+    # silently disables its autotune (which would make the comparison unfair).
+    if tune:
+        print("\n[BENCH] Letting official kernel autotune itself (no tile kwargs)...")
+        kernel_official = official_gqa_flashattn(
+            batch, heads, seq_len, dim, is_causal,
+            groups=num_groups,
+        )
+        off_cfg = getattr(kernel_official, "config", None)
+        if off_cfg is not None:
+            print(f"[BENCH] Official tuned config: {off_cfg}")
+    else:
+        kernel_official = official_gqa_flashattn(
+            batch, heads, seq_len, dim, is_causal,
+            groups=num_groups,
+            block_M=official_block_M,
+            block_N=official_block_N,
+            num_stages=official_num_stages,
+            threads=official_threads,
+        )
+
+    # ---- CUDA source diff (mine vs official) ----
+    # If both kernels lower to byte-identical CUDA, any perf gap is measurement noise.
+    # If they differ, the diff localizes which lowering choice changed.
+    off_src_path = f"/tmp/gqa_flash_attn_official_s{seq_len}_d{dim}.cu"
+    with open(off_src_path, "w") as f:
+        f.write(kernel_official.get_kernel_source())
+    print(f"Official CUDA source saved to: {off_src_path}")
+
+    import difflib
+    mine_lines = kernel.get_kernel_source().splitlines(keepends=True)
+    off_lines = kernel_official.get_kernel_source().splitlines(keepends=True)
+    if mine_lines == off_lines:
+        print(f"\n[CUDA DIFF] Identical ({len(mine_lines)} lines each).")
+        print("            → any latency gap is measurement noise, not a code difference.")
+    else:
+        # Summary stats
+        added = sum(1 for l in difflib.unified_diff(off_lines, mine_lines, n=0) if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in difflib.unified_diff(off_lines, mine_lines, n=0) if l.startswith("-") and not l.startswith("---"))
+        print(f"\n[CUDA DIFF] mine={len(mine_lines)} lines  official={len(off_lines)} lines  "
+              f"(+{added} / -{removed} vs official)")
+        # Write full unified diff to disk for inspection
+        diff_path = f"/tmp/gqa_flash_attn_diff_s{seq_len}_d{dim}.diff"
+        with open(diff_path, "w") as f:
+            f.writelines(difflib.unified_diff(
+                off_lines, mine_lines,
+                fromfile="official.cu", tofile="mine.cu", n=3,
+            ))
+        print(f"            full diff written to: {diff_path}")
+        # Print the first ~40 lines of the diff inline so the user sees the shape immediately
+        print("\n            --- first hunks (head -40 of diff) ---")
+        head = list(difflib.unified_diff(
+            off_lines, mine_lines,
+            fromfile="official.cu", tofile="mine.cu", n=3,
+        ))[:40]
+        for line in head:
+            print("            " + line.rstrip())
 
     # PyTorch sdpa (native flash attention via cuDNN)
     def ptx_sdpa(q, k, v, causal):
@@ -555,15 +599,26 @@ def benchmark_sweep(
                 num_stages=ns, threads=th,
             )
 
-        # Official baseline — always at the CLI-provided config (default 64/64/2/128).
-        # When tuning, this exposes the autotune gain instead of hiding it behind
-        # an identical-config tie.
-        kernel_official = official_gqa_flashattn(
-            batch, heads, seq_len, dim, is_causal,
-            groups=num_groups,
-            block_M=block_M, block_N=block_N,
-            num_stages=num_stages, threads=threads,
-        )
+        # Official baseline.
+        # When tune=True: omit tile kwargs so the official's @autotune actually fires.
+        # When tune=False: pass the user-CLI defaults so both sit at the same config.
+        if tune:
+            kernel_official = official_gqa_flashattn(
+                batch, heads, seq_len, dim, is_causal,
+                groups=num_groups,
+            )
+            off_cfg = getattr(kernel_official, "config", None)
+            if off_cfg is not None:
+                print(f"  [BENCH]    official tuned cfg: block_M={off_cfg.get('block_M')}, "
+                      f"block_N={off_cfg.get('block_N')}, num_stages={off_cfg.get('num_stages')}, "
+                      f"threads={off_cfg.get('threads')}")
+        else:
+            kernel_official = official_gqa_flashattn(
+                batch, heads, seq_len, dim, is_causal,
+                groups=num_groups,
+                block_M=block_M, block_N=block_N,
+                num_stages=num_stages, threads=threads,
+            )
 
         # Correctness
         result = kernel(Q, K, V)
