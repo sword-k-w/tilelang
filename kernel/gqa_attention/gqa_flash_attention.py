@@ -31,6 +31,12 @@ if _examples_dir not in sys.path:
     sys.path.insert(0, _examples_dir)
 from example_gqa_fwd_bshd import flashattn as official_gqa_flashattn
 
+# Import Triton GQA kernels for comparison (same dir as this file)
+_triton_path = os.path.dirname(os.path.abspath(__file__))
+if _triton_path not in sys.path:
+    sys.path.insert(0, _triton_path)
+from triton_gqa_bench import triton_gqa_fwd, triton_gqa_fwd_ga
+
 
 # =============================================================================
 # Autotune Search Space
@@ -812,6 +818,8 @@ def main(
     lat_mine = do_bench(lambda: kernel(Q, K, V), warmup=500, rep=100)
     lat_mine_ga = do_bench(lambda: kernel_ga(Q, K, V), warmup=500, rep=100)
     lat_official = do_bench(lambda: kernel_official(Q, K, V), warmup=500, rep=100)
+    lat_triton = do_bench(lambda: triton_gqa_fwd(Q, K, V, is_causal=is_causal), warmup=500, rep=100)
+    lat_triton_ga = do_bench(lambda: triton_gqa_fwd_ga(Q, K, V, is_causal=is_causal), warmup=500, rep=100)
     lat_sdpa = do_bench(lambda: ptx_sdpa(Q, K, V, is_causal), warmup=500, rep=100)
     lat_manual = do_bench(lambda: ptx_manual(Q, K, V, is_causal), warmup=500, rep=100)
 
@@ -820,16 +828,19 @@ def main(
         flops *= 0.5
 
     print("\n--- Performance ---")
-    print(f"{'Backend':<35} {'Latency (ms)':<15} {'TFlops':<10}")
-    print("-" * 60)
-    print(f"{'My GQA Flash Attn (standard)':<35} {lat_mine:<15.4f} {flops / lat_mine * 1e-9:<10.2f}")
-    print(f"{'My GQA Flash Attn (group-aware)':<35} {lat_mine_ga:<15.4f} {flops / lat_mine_ga * 1e-9:<10.2f}")
-    print(f"{'TileLang Official GQA':<35} {lat_official:<15.4f} {flops / lat_official * 1e-9:<10.2f}")
-    print(f"{'PyTorch sdpa (cuDNN FA)':<35} {lat_sdpa:<15.4f} {flops / lat_sdpa * 1e-9:<10.2f}")
-    print(f"{'PyTorch manual (no fusion)':<35} {lat_manual:<15.4f} {flops / lat_manual * 1e-9:<10.2f}")
+    print(f"{'Backend':<40} {'Latency (ms)':<15} {'TFlops':<10}")
+    print("-" * 65)
+    print(f"{'TileLang GQA (standard)':<40} {lat_mine:<15.4f} {flops / lat_mine * 1e-9:<10.2f}")
+    print(f"{'TileLang GQA (group-aware)':<40} {lat_mine_ga:<15.4f} {flops / lat_mine_ga * 1e-9:<10.2f}")
+    print(f"{'TileLang Official GQA':<40} {lat_official:<15.4f} {flops / lat_official * 1e-9:<10.2f}")
+    print(f"{'Triton GQA (standard)':<40} {lat_triton:<15.4f} {flops / lat_triton * 1e-9:<10.2f}")
+    print(f"{'Triton GQA (group-aware)':<40} {lat_triton_ga:<15.4f} {flops / lat_triton_ga * 1e-9:<10.2f}")
+    print(f"{'PyTorch sdpa (cuDNN FA)':<40} {lat_sdpa:<15.4f} {flops / lat_sdpa * 1e-9:<10.2f}")
+    print(f"{'PyTorch manual (no fusion)':<40} {lat_manual:<15.4f} {flops / lat_manual * 1e-9:<10.2f}")
     print(f"\nStandard      vs Official: {lat_official / lat_mine:.2f}x")
     print(f"Group-aware   vs Official: {lat_official / lat_mine_ga:.2f}x")
     print(f"Group-aware   vs Standard: {lat_mine / lat_mine_ga:.2f}x")
+    print(f"Triton std    vs TileLang std: {lat_mine / lat_triton:.2f}x")
 
     return kernel
 
@@ -964,6 +975,8 @@ def benchmark_sweep(
         lat_mine = do_bench(lambda: kernel(Q, K, V), warmup=500, rep=100)
         lat_mine_ga = do_bench(lambda: kernel_ga(Q, K, V), warmup=500, rep=100)
         lat_official = do_bench(lambda: kernel_official(Q, K, V), warmup=500, rep=100)
+        lat_triton = do_bench(lambda: triton_gqa_fwd(Q, K, V, is_causal=is_causal), warmup=500, rep=100)
+        lat_triton_ga = do_bench(lambda: triton_gqa_fwd_ga(Q, K, V, is_causal=is_causal), warmup=500, rep=100)
         lat_sdpa = do_bench(lambda: ptx_sdpa(Q, K, V), warmup=500, rep=100)
         lat_manual = do_bench(lambda: ref_gqa(Q, K, V, is_causal=is_causal), warmup=500, rep=100)
 
@@ -978,33 +991,37 @@ def benchmark_sweep(
             "mine_tflops": flops / lat_mine * 1e-9,
             "mine_ga_tflops": flops / lat_mine_ga * 1e-9,
             "official_ms": lat_official,
+            "triton_ms": lat_triton,
+            "triton_ga_ms": lat_triton_ga,
             "sdpa_ms": lat_sdpa,
             "manual_ms": lat_manual,
             "config": {"block_M": bM, "block_N": bN, "num_stages": ns, "threads": th},
         })
 
         print(f"  Standard: {lat_mine:.4f} ms  |  Group-aware: {lat_mine_ga:.4f} ms  |  "
-              f"Official: {lat_official:.4f} ms  |  sdpa: {lat_sdpa:.4f} ms  |  Manual: {lat_manual:.4f} ms")
+              f"Official: {lat_official:.4f} ms  |  Triton: {lat_triton:.4f} ms  |  "
+              f"Triton-GA: {lat_triton_ga:.4f} ms  |  sdpa: {lat_sdpa:.4f} ms  |  Manual: {lat_manual:.4f} ms")
 
     # Print summary table
     print("\n" + "=" * 80)
     print("Summary Table")
     print("=" * 80)
     if tune:
-        header = f"{'seq_len':<8} {'cfg(bM,bN,ns,th)':<20} {'Std (ms)':<11} {'GA (ms)':<10} {'Official':<10} {'sdpa':<10} {'Manual':<11} {'GA vs Std':<11} {'GA vs Off':<11}"
+        header = f"{'seq_len':<8} {'cfg(bM,bN,ns,th)':<20} {'Std':<10} {'GA':<10} {'Off':<9} {'Triton':<10} {'TritonGA':<10} {'sdpa':<10} {'Manual':<10} {'GA/Std':<9} {'GA/Off':<9}"
     else:
-        header = f"{'seq_len':<10} {'Std (ms)':<11} {'GA (ms)':<10} {'Official':<10} {'sdpa':<10} {'Manual':<11} {'GA vs Std':<11} {'GA vs Off':<11}"
+        header = f"{'seq_len':<8} {'Std':<10} {'GA':<10} {'Off':<9} {'Triton':<10} {'TritonGA':<10} {'sdpa':<10} {'Manual':<10} {'GA/Std':<9} {'GA/Off':<9} {'Tri/Std':<9}"
     print(header)
     print("-" * len(header))
     for r in results:
         ga_vs_std = r["mine_ms"] / r["mine_ga_ms"]
         ga_vs_off = r["official_ms"] / r["mine_ga_ms"]
+        tri_vs_std = r["mine_ms"] / r["triton_ms"]
         if tune:
             c = r["config"]
             cfg_str = f"({c['block_M']},{c['block_N']},{c['num_stages']},{c['threads']})"
-            print(f"{r['seq_len']:<8} {cfg_str:<20} {r['mine_ms']:<11.4f} {r['mine_ga_ms']:<10.4f} {r['official_ms']:<10.4f} {r['sdpa_ms']:<10.4f} {r['manual_ms']:<11.4f} {ga_vs_std:<11.2f}x {ga_vs_off:<11.2f}x")
+            print(f"{r['seq_len']:<8} {cfg_str:<20} {r['mine_ms']:<10.4f} {r['mine_ga_ms']:<10.4f} {r['official_ms']:<9.4f} {r['triton_ms']:<10.4f} {r['triton_ga_ms']:<10.4f} {r['sdpa_ms']:<10.4f} {r['manual_ms']:<10.4f} {ga_vs_std:<9.2f}x {ga_vs_off:<9.2f}x {tri_vs_std:<9.2f}x")
         else:
-            print(f"{r['seq_len']:<10} {r['mine_ms']:<11.4f} {r['mine_ga_ms']:<10.4f} {r['official_ms']:<10.4f} {r['sdpa_ms']:<10.4f} {r['manual_ms']:<11.4f} {ga_vs_std:<11.2f}x {ga_vs_off:<11.2f}x")
+            print(f"{r['seq_len']:<8} {r['mine_ms']:<10.4f} {r['mine_ga_ms']:<10.4f} {r['official_ms']:<9.4f} {r['triton_ms']:<10.4f} {r['triton_ga_ms']:<10.4f} {r['sdpa_ms']:<10.4f} {r['manual_ms']:<10.4f} {ga_vs_std:<9.2f}x {ga_vs_off:<9.2f}x {tri_vs_std:<9.2f}x")
 
     return results
 
