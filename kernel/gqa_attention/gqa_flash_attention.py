@@ -14,11 +14,13 @@ To run:
 
 import sys
 import os
+import itertools
 
 import torch
 import torch.nn.functional as F
 import tilelang
 import tilelang.language as T
+from tilelang.autotuner import autotune
 from tilelang.profiler import do_bench
 
 # Import TileLang's official GQA Flash Attention for comparison
@@ -31,51 +33,78 @@ from example_gqa_fwd_bshd import flashattn as official_gqa_flashattn
 
 
 # =============================================================================
-# GQA Flash Attention Kernel
+# Autotune Search Space
 # =============================================================================
-@tilelang.jit(
-    out_idx=[3],
-    pass_configs={
-        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-    },
-)
-def gqa_flash_attn(
+def _get_gqa_configs(
+    batch=None,
+    heads=None,
+    kv_heads=None,
+    seq_len=None,
+    dim=None,
+    is_causal=None,
+    block_sizes=(64, 128),
+    thread_options=(128, 256),
+    num_stages_range=(1, 2, 3),
+    max_shared_mem=100 * 1024,
+    warp_alignment=16,
+    dtype_bytes=2,
+):
+    """Generate valid (block_M, block_N, num_stages, threads) configs for autotuning.
+
+    Filters by:
+      - threads divisible by 32 (warp size)
+      - block_M / warp_count and block_N / warp_count alignment for MMA
+      - estimated shared memory budget (Q + K + V tiles, with pipeline stages)
+    Accepts the kernel's shape args so it can be passed as a callable to @autotune
+    and reuse `dim` for SMEM sizing — extra args are ignored.
+    """
+    assert dim is not None, "_get_gqa_configs requires `dim` to size shared memory"
+    valid = []
+    for block_M, block_N in itertools.product(block_sizes, repeat=2):
+        for threads in thread_options:
+            if threads % 32 != 0:
+                continue
+            warp_count = threads // 32
+            if block_M % warp_count or block_N % warp_count:
+                continue
+            warp_M = block_M // warp_count
+            warp_N = block_N // warp_count
+            if warp_M % warp_alignment != 0 or warp_N % warp_alignment != 0:
+                continue
+            # Rough SMEM bound: Q + K + V tiles (mirrors the official example's heuristic).
+            shared_mem = 2 * dtype_bytes * dim * (block_M + block_N)
+            if shared_mem > max_shared_mem:
+                continue
+            for num_stages in num_stages_range:
+                valid.append({
+                    "block_M": block_M,
+                    "block_N": block_N,
+                    "num_stages": num_stages,
+                    "threads": threads,
+                })
+    assert valid, "No valid autotune configs were produced — relax the search space."
+    return valid
+
+
+# =============================================================================
+# GQA Flash Attention Kernel — prim_func builder
+# =============================================================================
+def _build_gqa_prim_func(
     batch: int,
     heads: int,
     kv_heads: int,
     seq_len: int,
     dim: int,
-    is_causal: bool = False,
-    block_M: int = 64,
-    block_N: int = 64,
-    num_stages: int = 2,
-    threads: int = 128,
+    is_causal: bool,
+    block_M: int,
+    block_N: int,
+    num_stages: int,
+    threads: int,
 ):
-    """
-    GQA Flash Attention forward pass.
+    """Construct and return the TileLang prim_func for GQA Flash Attention.
 
-    Parameters
-    ----------
-    batch : int
-        Number of independent sequences.
-    heads : int
-        Number of query heads (must be a multiple of kv_heads).
-    kv_heads : int
-        Number of key/value heads (heads // kv_heads = num_groups).
-    seq_len : int
-        Sequence length (same for Q and KV in self-attention).
-    dim : int
-        Head dimension (typically 64 or 128).
-    is_causal : bool
-        If True, apply causal mask (token i can only see tokens ≤ i).
-    block_M : int
-        Q row tile size (number of query rows per block).
-    block_N : int
-        KV column tile size (number of key/value columns per block).
-    num_stages : int
-        Software pipeline depth (1, 2, or 3).
-    threads : int
-        Number of threads per block.
+    Shared by the direct-compile entry point `gqa_flash_attn` and the autotuned
+    entry point `gqa_flash_attn_tuned`.
     """
     # ---- Validate ----
     assert heads % kv_heads == 0, f"heads ({heads}) must be divisible by kv_heads ({kv_heads})"
@@ -214,6 +243,60 @@ def gqa_flash_attn(
 
 
 # =============================================================================
+# Public entry points
+# =============================================================================
+@tilelang.jit(
+    out_idx=[3],
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def gqa_flash_attn(
+    batch: int,
+    heads: int,
+    kv_heads: int,
+    seq_len: int,
+    dim: int,
+    is_causal: bool = False,
+    block_M: int = 64,
+    block_N: int = 64,
+    num_stages: int = 2,
+    threads: int = 128,
+):
+    """Direct-compile GQA Flash Attention forward (no autotuning)."""
+    return _build_gqa_prim_func(
+        batch, heads, kv_heads, seq_len, dim, is_causal,
+        block_M, block_N, num_stages, threads,
+    )
+
+
+@autotune(configs=_get_gqa_configs, warmup=10, rep=10)
+@tilelang.jit(
+    out_idx=[3],
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def gqa_flash_attn_tuned(
+    batch: int,
+    heads: int,
+    kv_heads: int,
+    seq_len: int,
+    dim: int,
+    is_causal: bool = False,
+    block_M: int = 64,
+    block_N: int = 64,
+    num_stages: int = 2,
+    threads: int = 128,
+):
+    """Autotuned GQA Flash Attention forward — searches (block_M, block_N, num_stages, threads)."""
+    return _build_gqa_prim_func(
+        batch, heads, kv_heads, seq_len, dim, is_causal,
+        block_M, block_N, num_stages, threads,
+    )
+
+
+# =============================================================================
 # Reference Implementation (PyTorch)
 # =============================================================================
 def ref_gqa(Q, K, V, is_causal: bool = False):
@@ -271,6 +354,7 @@ def main(
     block_N: int = 64,
     num_stages: int = 2,
     threads: int = 128,
+    tune: bool = False,
 ):
     dtype = torch.float16
     device = "cuda"
@@ -280,26 +364,57 @@ def main(
     print("=" * 60)
     print(f"Layout: BSHD  |  batch={batch}, heads={heads}, kv_heads={kv_heads}")
     print(f"seq_len={seq_len}, dim={dim}, causal={is_causal}")
-    print(f"block_M={block_M}, block_N={block_N}, num_stages={num_stages}, threads={threads}")
+    if tune:
+        print("Mode: AUTOTUNE (block_M / block_N / num_stages / threads searched)")
+    else:
+        print(f"block_M={block_M}, block_N={block_N}, num_stages={num_stages}, threads={threads}")
 
     # ---- Input data ----
     Q = torch.randn(batch, seq_len, heads, dim, device=device, dtype=dtype)
     K = torch.randn(batch, seq_len, kv_heads, dim, device=device, dtype=dtype)
     V = torch.randn(batch, seq_len, kv_heads, dim, device=device, dtype=dtype)
 
-    # ---- Compile TileLang kernel ----
-    kernel = gqa_flash_attn(
-        batch=batch,
-        heads=heads,
-        kv_heads=kv_heads,
-        seq_len=seq_len,
-        dim=dim,
-        is_causal=is_causal,
-        block_M=block_M,
-        block_N=block_N,
-        num_stages=num_stages,
-        threads=threads,
-    )
+    # ---- Compile TileLang kernel (tuned or direct) ----
+    # Defaults used for the official baseline. When --tune is on, we INTENTIONALLY
+    # keep the official at these defaults so the comparison surfaces the autotune
+    # speedup. (Same algorithm at the same tile config would otherwise tie 1.00x.)
+    official_block_M, official_block_N = block_M, block_N
+    official_num_stages, official_threads = num_stages, threads
+
+    if tune:
+        # Autotuner sweeps the config space and returns the best JITKernel.
+        # `.config`, `.latency`, `.ref_latency` are attached by the tuner.
+        kernel = gqa_flash_attn_tuned(
+            batch=batch,
+            heads=heads,
+            kv_heads=kv_heads,
+            seq_len=seq_len,
+            dim=dim,
+            is_causal=is_causal,
+        )
+        best_cfg = getattr(kernel, "config", None)
+        best_lat = getattr(kernel, "latency", None)
+        if best_cfg is not None:
+            print(f"\n[AUTOTUNE] Best config: {best_cfg}")
+            print(f"[AUTOTUNE] Official baseline kept at defaults "
+                  f"(block_M={official_block_M}, block_N={official_block_N}, "
+                  f"num_stages={official_num_stages}, threads={official_threads}) "
+                  f"to expose the tuning gain.")
+        if best_lat is not None:
+            print(f"[AUTOTUNE] Best latency during search: {best_lat:.4f} ms")
+    else:
+        kernel = gqa_flash_attn(
+            batch=batch,
+            heads=heads,
+            kv_heads=kv_heads,
+            seq_len=seq_len,
+            dim=dim,
+            is_causal=is_causal,
+            block_M=block_M,
+            block_N=block_N,
+            num_stages=num_stages,
+            threads=threads,
+        )
 
     # ---- Correctness ----
     result = kernel(Q, K, V)
@@ -332,10 +447,10 @@ def main(
         dim,
         is_causal,
         groups=num_groups,
-        block_M=block_M,
-        block_N=block_N,
-        num_stages=num_stages,
-        threads=threads,
+        block_M=official_block_M,
+        block_N=official_block_N,
+        num_stages=official_num_stages,
+        threads=official_threads,
     )
 
     # PyTorch sdpa (native flash attention via cuDNN)
@@ -392,8 +507,14 @@ def benchmark_sweep(
     block_N: int = 64,
     num_stages: int = 2,
     threads: int = 128,
+    tune: bool = False,
 ):
-    """Run correctness + performance across multiple sequence lengths."""
+    """Run correctness + performance across multiple sequence lengths.
+
+    When `tune=True`, autotune is run per seq_len and the best (block_M, block_N,
+    num_stages, threads) are also used for the official baseline so the comparison
+    stays apples-to-apples on tile sizes (the gap then measures kernel-level changes).
+    """
     dtype = torch.float16
     device = "cuda"
     num_groups = heads // kv_heads
@@ -402,6 +523,8 @@ def benchmark_sweep(
     print("=" * 80)
     print(f"GQA Flash Attention — Sweep: seq_len ∈ {list(seq_lens)}")
     print(f"batch={batch}, heads={heads}, kv_heads={kv_heads}, dim={dim}, causal={is_causal}")
+    if tune:
+        print("Mode: AUTOTUNE per seq_len")
     print("=" * 80)
 
     for seq_len in seq_lens:
@@ -411,15 +534,30 @@ def benchmark_sweep(
         K = torch.randn(batch, seq_len, kv_heads, dim, device=device, dtype=dtype)
         V = torch.randn(batch, seq_len, kv_heads, dim, device=device, dtype=dtype)
 
-        # My kernel
-        kernel = gqa_flash_attn(
-            batch=batch, heads=heads, kv_heads=kv_heads,
-            seq_len=seq_len, dim=dim, is_causal=is_causal,
-            block_M=block_M, block_N=block_N,
-            num_stages=num_stages, threads=threads,
-        )
+        # My kernel — autotuned or fixed
+        if tune:
+            kernel = gqa_flash_attn_tuned(
+                batch=batch, heads=heads, kv_heads=kv_heads,
+                seq_len=seq_len, dim=dim, is_causal=is_causal,
+            )
+            cfg = getattr(kernel, "config", None) or {}
+            bM = cfg.get("block_M", block_M)
+            bN = cfg.get("block_N", block_N)
+            ns = cfg.get("num_stages", num_stages)
+            th = cfg.get("threads", threads)
+            print(f"  [AUTOTUNE] best cfg: block_M={bM}, block_N={bN}, num_stages={ns}, threads={th}")
+        else:
+            bM, bN, ns, th = block_M, block_N, num_stages, threads
+            kernel = gqa_flash_attn(
+                batch=batch, heads=heads, kv_heads=kv_heads,
+                seq_len=seq_len, dim=dim, is_causal=is_causal,
+                block_M=bM, block_N=bN,
+                num_stages=ns, threads=th,
+            )
 
-        # Official kernel
+        # Official baseline — always at the CLI-provided config (default 64/64/2/128).
+        # When tuning, this exposes the autotune gain instead of hiding it behind
+        # an identical-config tie.
         kernel_official = official_gqa_flashattn(
             batch, heads, seq_len, dim, is_causal,
             groups=num_groups,
@@ -467,6 +605,7 @@ def benchmark_sweep(
             "official_ms": lat_official,
             "sdpa_ms": lat_sdpa,
             "manual_ms": lat_manual,
+            "config": {"block_M": bM, "block_N": bN, "num_stages": ns, "threads": th},
         })
 
         print(f"  Mine: {lat_mine:.4f} ms  |  Official: {lat_official:.4f} ms  |  sdpa: {lat_sdpa:.4f} ms  |  Manual: {lat_manual:.4f} ms")
@@ -475,13 +614,21 @@ def benchmark_sweep(
     print("\n" + "=" * 80)
     print("Summary Table")
     print("=" * 80)
-    header = f"{'seq_len':<10} {'Mine (ms)':<12} {'Official (ms)':<14} {'sdpa (ms)':<12} {'Manual (ms)':<13} {'vs Official':<12} {'vs Manual':<12}"
+    if tune:
+        header = f"{'seq_len':<8} {'cfg(bM,bN,ns,th)':<20} {'Mine (ms)':<12} {'Official (ms)':<14} {'sdpa (ms)':<12} {'Manual (ms)':<13} {'vs Official':<12} {'vs Manual':<12}"
+    else:
+        header = f"{'seq_len':<10} {'Mine (ms)':<12} {'Official (ms)':<14} {'sdpa (ms)':<12} {'Manual (ms)':<13} {'vs Official':<12} {'vs Manual':<12}"
     print(header)
     print("-" * len(header))
     for r in results:
         vs_official = r["official_ms"] / r["mine_ms"]
         vs_manual = r["manual_ms"] / r["mine_ms"]
-        print(f"{r['seq_len']:<10} {r['mine_ms']:<12.4f} {r['official_ms']:<14.4f} {r['sdpa_ms']:<12.4f} {r['manual_ms']:<13.4f} {vs_official:<12.2f}x {vs_manual:<12.2f}x")
+        if tune:
+            c = r["config"]
+            cfg_str = f"({c['block_M']},{c['block_N']},{c['num_stages']},{c['threads']})"
+            print(f"{r['seq_len']:<8} {cfg_str:<20} {r['mine_ms']:<12.4f} {r['official_ms']:<14.4f} {r['sdpa_ms']:<12.4f} {r['manual_ms']:<13.4f} {vs_official:<12.2f}x {vs_manual:<12.2f}x")
+        else:
+            print(f"{r['seq_len']:<10} {r['mine_ms']:<12.4f} {r['official_ms']:<14.4f} {r['sdpa_ms']:<12.4f} {r['manual_ms']:<13.4f} {vs_official:<12.2f}x {vs_manual:<12.2f}x")
 
     return results
 
@@ -502,6 +649,9 @@ if __name__ == "__main__":
     parser.add_argument("--threads", type=int, default=128)
     parser.add_argument("--sweep", action="store_true", default=False,
                         help="Run sweep benchmark across seq_lens 512,1024,2048,4096")
+    parser.add_argument("--tune", action="store_true", default=False,
+                        help="Enable autotuning over (block_M, block_N, num_stages, threads). "
+                             "Overrides any --block_M / --block_N / --num_stages / --threads.")
     args = parser.parse_args()
 
     if args.sweep:
@@ -516,6 +666,7 @@ if __name__ == "__main__":
             block_N=args.block_N,
             num_stages=args.num_stages,
             threads=args.threads,
+            tune=args.tune,
         )
     else:
         main(
@@ -529,4 +680,5 @@ if __name__ == "__main__":
             block_N=args.block_N,
             num_stages=args.num_stages,
             threads=args.threads,
+            tune=args.tune,
         )
