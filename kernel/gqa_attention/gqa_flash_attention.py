@@ -22,7 +22,9 @@ import tilelang.language as T
 from tilelang.profiler import do_bench
 
 # Import TileLang's official GQA Flash Attention for comparison
-_examples_dir = os.path.join(os.path.dirname(tilelang.__file__), "..", "examples", "flash_attention")
+# Resolve relative to THIS file so it works on any machine
+_examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "examples", "flash_attention")
+_examples_dir = os.path.abspath(_examples_dir)
 if _examples_dir not in sys.path:
     sys.path.insert(0, _examples_dir)
 from example_gqa_fwd_bshd import flashattn as official_gqa_flashattn
@@ -149,14 +151,7 @@ def gqa_flash_attn(
                 # NOTE: K uses kv_head (not by) because KV has fewer heads
                 T.copy(K[bz, k * block_N : (k + 1) * block_N, kv_head, :], K_shared)
 
-                # ---- 4b. Apply mask before gemm ----
-                # TODO: Fill S_local with the appropriate mask values.
-                #   - If causal: position (i, j) maps to global (q_idx, k_idx).
-                #     Set to 0 if q_idx >= k_idx, else -inf.
-                #   - If non-causal: mask out padding positions where
-                #     k * block_N + j >= seq_len.
-                #   - Use T.Parallel(block_M, block_N) to iterate.
-                #   - Use T.if_then_else(cond, true_val, false_val).
+                # ---- 4b. Apply mask before gemm (S_local is ACCUMULATED into) ----
                 if is_causal:
                     for i, j in T.Parallel(block_M, block_N):
                         S_local[i, j] = T.if_then_else(
@@ -172,88 +167,41 @@ def gqa_flash_attn(
                             0,
                         )
                 # ---- 4c. Compute S = Q @ K^T ----
-                # S_local is ACCUMULATED into: S_local += Q_shared @ K_shared^T
-                # This means your mask values (0 or -inf) set the base,
-                # and the dot products are added on top.
                 T.gemm(Q_shared, K_shared, S_local, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
-                # ============================================================
-                # TODO: ONLINE SOFTMAX — implement the 6-step rescaling logic
-                # ============================================================
-                #
-                # You need to:
-                #
-                #   (1) Save old max, reset S_max:
-                #         T.copy(S_max, S_max_prev)
-                #         T.fill(S_max, -T.infinity(accum_dtype))
-                #
-                #   (2) Compute row-wise max of the NEW S_local block:
-                #         T.reduce_max(S_local, S_max, dim=1, clear=False)
-                #
-                #   (3) Update running max:
-                #         S_max[i] = T.max(S_max[i], S_max_prev[i])
-                #         (use T.Parallel(block_M))
-                #
-                #   (4) Compute rescale factor:
-                #         rescale[i] = T.exp2(
-                #             S_max_prev[i] * scale - S_max[i] * scale
-                #         )
-                #
-                #   (5) Rescale old O_local BEFORE adding new contributions:
-                #         O_local[i, j] *= rescale[i]
-                #         (use T.Parallel(block_M, dim))
-                #
-                #   (6) Compute softmax numerators P = exp(S - max):
-                #         S_local[i, j] = T.exp2(
-                #             S_local[i, j] * scale - S_max[i] * scale
-                #         )
-                #         (use T.Parallel(block_M, block_N))
-                #         This REPLACES S_local in-place — S is overwritten by P.
-                #
-                #   (7) Update total_sum:
-                #         T.reduce_sum(S_local, S_exp_sum, dim=1)
-                #         total_sum[i] = total_sum[i] * rescale[i] + S_exp_sum[i]
-                #         (use T.Parallel(block_M))
-                #
-                #   (8) Cast P from fp32 to fp16 for the next gemm:
-                #         T.copy(S_local, S_local_fp16)
-                #
-                # Key insight: scale = 1/sqrt(dim) * log2(e).
-                #   exp2(x * scale) = exp(x / sqrt(dim)).
-                # The rescale factor exp2((m_old - m_new) * scale) equals
-                # exp((m_old - m_new) / sqrt(dim)) — corrects old softmax
-                # numerators to use the new, larger max.
-                #
-                # ============================================================
-
+                # ---- 4d. Online softmax rescaling (Dao et al. 2022, Algorithm 1) ----
+                # (1) Save old per-row max
                 T.copy(S_max, S_max_prev)
                 T.fill(S_max, -T.infinity(accum_dtype))
 
+                # (2–3) Row-wise max of new S block; update running max
                 T.reduce_max(S_local, S_max, dim=1, clear=False)
-
                 for i in T.Parallel(block_M):
                     S_max[i] = T.max(S_max[i], S_max_prev[i])
+                    # (4) Rescale factor: exp((m_old - m_new) / sqrt(d))
                     rescale[i] = T.exp2(S_max_prev[i] * scale - S_max[i] * scale)
 
+                # (5) Rescale old output accumulation
+                for i, j in T.Parallel(block_M, dim):
+                    O_local[i, j] *= rescale[i]
+
+                # (6) P = softmax(S) = exp((S - m_new) / sqrt(d))
                 for i, j in T.Parallel(block_M, block_N):
                     S_local[i, j] = T.exp2(S_local[i, j] * scale - S_max[i] * scale)
 
+                # (7) Update running softmax denominator
                 T.reduce_sum(S_local, S_exp_sum, dim=1)
                 for i in T.Parallel(block_M):
                     total_sum[i] = total_sum[i] * rescale[i] + S_exp_sum[i]
 
-                for i, j in T.Parallel(block_M, dim):
-                    O_local[i, j] *= rescale[i]
-
+                # (8) Cast P to fp16 for tensor core gemm
                 T.copy(S_local, S_local_fp16)
-                # ---- 4d. Load V and accumulate P @ V → O_local ----
+
+                # ---- 4e. Load V, accumulate P @ V → O_local ----
                 T.copy(V[bz, k * block_N : (k + 1) * block_N, kv_head, :], V_shared)
                 T.gemm(S_local_fp16, V_shared, O_local, policy=T.GemmWarpPolicy.FullRow)
 
-            # ---- Step 5: Final normalization ----
-            # Divide each row of the accumulated output by its softmax denominator.
-            # Normalize the output by the total sum.
-            # TODO: implement the normalization
+            # ---- Step 5: Final normalization O /= sum(P) ----
             for i, j in T.Parallel(block_M, dim):
                 O_local[i, j] /= total_sum[i]
 
@@ -407,10 +355,10 @@ def main(
     def ptx_manual(q, k, v, causal):
         return ref_gqa(q, k, v, is_causal=causal)
 
-    lat_mine = do_bench(lambda: kernel(Q, K, V), warmup=25, rep=100)
-    lat_official = do_bench(lambda: kernel_official(Q, K, V), warmup=25, rep=100)
-    lat_sdpa = do_bench(lambda: ptx_sdpa(Q, K, V, is_causal), warmup=25, rep=100)
-    lat_manual = do_bench(lambda: ptx_manual(Q, K, V, is_causal), warmup=25, rep=100)
+    lat_mine = do_bench(lambda: kernel(Q, K, V), warmup=500, rep=100)
+    lat_official = do_bench(lambda: kernel_official(Q, K, V), warmup=500, rep=100)
+    lat_sdpa = do_bench(lambda: ptx_sdpa(Q, K, V, is_causal), warmup=500, rep=100)
+    lat_manual = do_bench(lambda: ptx_manual(Q, K, V, is_causal), warmup=500, rep=100)
 
     flops = 2.0 * batch * heads * seq_len * seq_len * dim * 2  # 2 matmuls (QK^T + PV)
     if is_causal:
@@ -430,6 +378,114 @@ def main(
     return kernel
 
 
+# =============================================================================
+# Sweep Benchmark — seq_len vs latency across backends
+# =============================================================================
+def benchmark_sweep(
+    seq_lens=(512, 1024, 2048, 4096),
+    batch: int = 1,
+    heads: int = 32,
+    kv_heads: int = 8,
+    dim: int = 64,
+    is_causal: bool = False,
+    block_M: int = 64,
+    block_N: int = 64,
+    num_stages: int = 2,
+    threads: int = 128,
+):
+    """Run correctness + performance across multiple sequence lengths."""
+    dtype = torch.float16
+    device = "cuda"
+    num_groups = heads // kv_heads
+
+    results = []
+    print("=" * 80)
+    print(f"GQA Flash Attention — Sweep: seq_len ∈ {list(seq_lens)}")
+    print(f"batch={batch}, heads={heads}, kv_heads={kv_heads}, dim={dim}, causal={is_causal}")
+    print("=" * 80)
+
+    for seq_len in seq_lens:
+        print(f"\n--- seq_len = {seq_len} ---")
+
+        Q = torch.randn(batch, seq_len, heads, dim, device=device, dtype=dtype)
+        K = torch.randn(batch, seq_len, kv_heads, dim, device=device, dtype=dtype)
+        V = torch.randn(batch, seq_len, kv_heads, dim, device=device, dtype=dtype)
+
+        # My kernel
+        kernel = gqa_flash_attn(
+            batch=batch, heads=heads, kv_heads=kv_heads,
+            seq_len=seq_len, dim=dim, is_causal=is_causal,
+            block_M=block_M, block_N=block_N,
+            num_stages=num_stages, threads=threads,
+        )
+
+        # Official kernel
+        kernel_official = official_gqa_flashattn(
+            batch, heads, seq_len, dim, is_causal,
+            groups=num_groups,
+            block_M=block_M, block_N=block_N,
+            num_stages=num_stages, threads=threads,
+        )
+
+        # Correctness
+        result = kernel(Q, K, V)
+        reference = ref_gqa(Q, K, V, is_causal=is_causal)
+        try:
+            torch.testing.assert_close(result, reference, rtol=1e-2, atol=1e-2)
+            print("  [PASS] correctness")
+        except AssertionError as e:
+            max_err = (result.float() - reference.float()).abs().max().item()
+            print(f"  [FAIL] max error = {max_err:.6f}")
+            print(e)
+            continue
+
+        # Benchmarks
+        def ptx_sdpa(q, k, v):
+            q_b = q.permute(0, 2, 1, 3)
+            k_b = k.permute(0, 2, 1, 3)
+            v_b = v.permute(0, 2, 1, 3)
+            ng = q.shape[2] // k.shape[2]
+            k_be = k_b.repeat_interleave(ng, dim=1)
+            v_be = v_b.repeat_interleave(ng, dim=1)
+            o = F.scaled_dot_product_attention(q_b, k_be, v_be, is_causal=is_causal)
+            return o.permute(0, 2, 1, 3)
+
+        torch.cuda.synchronize()
+        lat_mine = do_bench(lambda: kernel(Q, K, V), warmup=500, rep=100)
+        lat_official = do_bench(lambda: kernel_official(Q, K, V), warmup=500, rep=100)
+        lat_sdpa = do_bench(lambda: ptx_sdpa(Q, K, V), warmup=500, rep=100)
+        lat_manual = do_bench(lambda: ref_gqa(Q, K, V, is_causal=is_causal), warmup=500, rep=100)
+
+        flops = 4.0 * batch * heads * seq_len * seq_len * dim  # QK^T + PV
+        if is_causal:
+            flops *= 0.5
+
+        results.append({
+            "seq_len": seq_len,
+            "mine_ms": lat_mine,
+            "mine_tflops": flops / lat_mine * 1e-9,
+            "official_ms": lat_official,
+            "sdpa_ms": lat_sdpa,
+            "manual_ms": lat_manual,
+        })
+
+        print(f"  Mine: {lat_mine:.4f} ms  |  Official: {lat_official:.4f} ms  |  sdpa: {lat_sdpa:.4f} ms  |  Manual: {lat_manual:.4f} ms")
+
+    # Print summary table
+    print("\n" + "=" * 80)
+    print("Summary Table")
+    print("=" * 80)
+    header = f"{'seq_len':<10} {'Mine (ms)':<12} {'Official (ms)':<14} {'sdpa (ms)':<12} {'Manual (ms)':<13} {'vs Official':<12} {'vs Manual':<12}"
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        vs_official = r["official_ms"] / r["mine_ms"]
+        vs_manual = r["manual_ms"] / r["mine_ms"]
+        print(f"{r['seq_len']:<10} {r['mine_ms']:<12.4f} {r['official_ms']:<14.4f} {r['sdpa_ms']:<12.4f} {r['manual_ms']:<13.4f} {vs_official:<12.2f}x {vs_manual:<12.2f}x")
+
+    return results
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -444,17 +500,33 @@ if __name__ == "__main__":
     parser.add_argument("--block_N", type=int, default=64)
     parser.add_argument("--num_stages", type=int, default=2)
     parser.add_argument("--threads", type=int, default=128)
+    parser.add_argument("--sweep", action="store_true", default=False,
+                        help="Run sweep benchmark across seq_lens 512,1024,2048,4096")
     args = parser.parse_args()
 
-    main(
-        batch=args.batch,
-        heads=args.heads,
-        kv_heads=args.kv_heads,
-        seq_len=args.seq_len,
-        dim=args.dim,
-        is_causal=args.is_causal,
-        block_M=args.block_M,
-        block_N=args.block_N,
-        num_stages=args.num_stages,
-        threads=args.threads,
-    )
+    if args.sweep:
+        benchmark_sweep(
+            seq_lens=(512, 1024, 2048, 4096),
+            batch=args.batch,
+            heads=args.heads,
+            kv_heads=args.kv_heads,
+            dim=args.dim,
+            is_causal=args.is_causal,
+            block_M=args.block_M,
+            block_N=args.block_N,
+            num_stages=args.num_stages,
+            threads=args.threads,
+        )
+    else:
+        main(
+            batch=args.batch,
+            heads=args.heads,
+            kv_heads=args.kv_heads,
+            seq_len=args.seq_len,
+            dim=args.dim,
+            is_causal=args.is_causal,
+            block_M=args.block_M,
+            block_N=args.block_N,
+            num_stages=args.num_stages,
+            threads=args.threads,
+        )
